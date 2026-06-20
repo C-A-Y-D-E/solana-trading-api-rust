@@ -1,0 +1,3 @@
+/target
+# never commit secrets (the live-buy test reads PRIVATE_KEY from here)
+.env
