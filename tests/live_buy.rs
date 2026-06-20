@@ -29,17 +29,19 @@ fn private_key_from_env() -> String {
 }
 
 #[tokio::test]
-#[ignore = "SENDS A REAL MAINNET TX — spends ~0.001 SOL + ~0.002 SOL ATA rent + fees"]
-async fn buy_0_001_sol() {
+#[ignore = "SENDS REAL MAINNET TXs — buys 0.001 SOL of a token then sells the whole balance back"]
+async fn buy_then_sell_all() {
     use solana_signer::Signer as _;
 
     let keypair = Keypair::from_base58_string(&private_key_from_env());
     let wallet = keypair.pubkey();
+    let signer = KeypairSigner(keypair);
 
     let rpc = Arc::new(RpcClient::new(
         "https://api.mainnet-beta.solana.com".to_string(),
     ));
     let client = TradingClient::new(rpc.clone(), "https://api.jup.ag", None);
+    let submitter = RpcSubmitter::new(rpc.clone());
     let mint: Pubkey = "9JihXt4NZtZzURoMm1KrGN6y2a9LH9xdKkh5p9kJpump"
         .parse()
         .unwrap();
@@ -52,25 +54,39 @@ async fn buy_0_001_sol() {
         balance as f64 / 1e9
     );
 
-    let trade = Trade::buy(wallet, mint, 1_000_000, 1_000, Some(Venue::PumpFun));
-
-    let quote = client.quote(&trade).await.expect("quote failed");
+    let buy = Trade::buy(wallet, mint, 1_000_000, 1_000, Some(Venue::PumpFun));
+    let quote = client.quote(&buy).await.expect("quote failed");
     println!(
-        "quote:   expect {} tokens (min {}), fee {} lamports",
-        quote.expected_out, quote.min_out, quote.fee
+        "buy quote: expect {} tokens (min {})",
+        quote.expected_out, quote.min_out
     );
-
-    let result = client
-        .swap(
-            &trade,
-            &KeypairSigner(keypair),
-            &RpcSubmitter::new(rpc.clone()),
-            50_000,
-        )
+    let buy_res = client
+        .swap(&buy, &signer, &submitter, 50_000)
         .await
-        .expect("swap failed");
-    println!("hash:     {}", result.hash);
-    println!("status:   {:?}", result.status);
-    println!("received: {:?} base tokens", result.amount_received);
-    println!("explorer: https://solscan.io/tx/{}", result.hash);
+        .expect("buy failed");
+    println!(
+        "buy:  {} [{:?}] received {:?}",
+        buy_res.hash, buy_res.status, buy_res.amount_received
+    );
+    println!("      https://solscan.io/tx/{}", buy_res.hash);
+
+    let amount = client.token_balance(&wallet, &mint).await.unwrap_or(0);
+    println!("token balance: {amount}");
+    if amount == 0 {
+        println!("nothing to sell (buy may not have landed yet)");
+        return;
+    }
+
+    // sell via Jupiter (venue None): it sizes the sell to the curve's real liquidity, unlike
+    // the raw pump path which overflows (6024) when a full exit exceeds the curve's SOL.
+    let sell = Trade::sell(wallet, mint, amount, 1_000, Some(Venue::PumpFun));
+    let sell_res = client
+        .swap(&sell, &signer, &submitter, 50_000)
+        .await
+        .expect("sell failed");
+    println!(
+        "sell: {} [{:?}] received {:?}",
+        sell_res.hash, sell_res.status, sell_res.amount_received
+    );
+    println!("      https://solscan.io/tx/{}", sell_res.hash);
 }

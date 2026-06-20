@@ -2,8 +2,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_pubkey::Pubkey;
 use solana_signature::Signature;
 
+use crate::dexes::common::ata;
 use crate::dexes::pumpfun::PumpFun;
 use crate::dexes::pumpswap::PumpSwap;
 use crate::error::{Result, TradeError};
@@ -123,6 +125,23 @@ impl TradingClient {
             .parse::<Signature>()
             .map_err(|_| TradeError::Decode("client", format!("bad signature {hash:?}")))?;
         check_status(&self.rpc, &sig).await
+    }
+
+    pub async fn token_balance(&self, wallet: &Pubkey, mint: &Pubkey) -> Result<u64> {
+        let mint_acc = self
+            .rpc
+            .get_account(mint)
+            .await
+            .map_err(|source| TradeError::Rpc { context: "get_account(mint)", source })?;
+        let token_account = ata(wallet, mint, &mint_acc.owner);
+        let bal = self
+            .rpc
+            .get_token_account_balance(&token_account)
+            .await
+            .map_err(|source| TradeError::Rpc { context: "token balance", source })?;
+        bal.amount
+            .parse()
+            .map_err(|_| TradeError::Decode("client", format!("bad token amount {}", bal.amount)))
     }
 }
 

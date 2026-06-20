@@ -61,7 +61,7 @@ struct Curve {
     creator: Pubkey,
     base_reserves: u64,
     quote_reserves: u64,
-
+    real_token_reserves: u64,
     token_program: Pubkey,
 }
 
@@ -132,10 +132,16 @@ impl PumpFun {
             .ok_or_else(|| anyhow!("pumpfun: mint not found: {mint}"))?;
         let c: BondingCurveAccount = decode_account(&curve_acc.data)
             .map_err(|e| anyhow!("pumpfun: bad bonding curve {curve_address}: {e}"))?;
+        if c.complete {
+            return Err(anyhow!(
+                "pumpfun: bonding curve complete — {mint} graduated; trade it via PumpSwap/Jupiter"
+            ));
+        }
         Ok(Curve {
             creator: c.creator,
             base_reserves: c.virtual_token_reserves,
             quote_reserves: c.virtual_quote_reserves,
+            real_token_reserves: c.real_token_reserves,
             token_program: mint_acc.owner,
         })
     }
@@ -158,7 +164,8 @@ impl PumpFun {
                     curve.quote_reserves,
                     curve.base_reserves,
                     sol_into_curve,
-                );
+                )
+                .min(curve.real_token_reserves);
 
                 Quote {
                     in_amount: amount,
