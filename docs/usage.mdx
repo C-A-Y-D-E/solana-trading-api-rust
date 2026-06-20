@@ -1,0 +1,221 @@
+---
+title: Using solana-trading-api as a (private) library
+description: >
+  How to depend on this crate privately from your backend and use it. Code never
+  leaves your repos — no crates.io, no public registry.
+status: living
+last_updated: 2026-06-20
+---
+
+# Using `solana-trading-api` from your backend
+
+A signing-agnostic library: build a `Trade`, call `quote` / `swap`. It picks the
+venue, derives the pool, builds + simulates the tx, and signs via *your* `Signer`
+(Turnkey). Marked `publish = false`, so it can never reach crates.io.
+
+---
+
+## 1. Keep it private
+
+Neither option touches a public registry.
+
+**Path dependency (monorepo / local) — simplest:**
+```toml
+# backend/Cargo.toml
+[dependencies]
+solana-trading-api = { path = "../solana-trading-api" }
+```
+
+**Private git dependency (separate private repo):**
+```toml
+solana-trading-api = { git = "ssh://git@github.com/<you>/solana-trading-api.git", tag = "v0.1.0" }
+```
+Authenticate with SSH + `git-fetch-with-cli = true` in `~/.cargo/config.toml` (or a
+deploy key / PAT in CI). Cargo fetches the source to build; it stays in your repo.
+
+You also need `async-trait`, `anyhow`, and `tokio` in your backend.
+
+---
+
+## 2. The whole flow
+
+```rust
+use solana_trading_api::{TradingClient, Trade, Venue, RpcClient, BloxrouteSubmitter};
+use std::sync::Arc;
+
+let rpc = Arc::new(RpcClient::new("https://your-rpc".into()));
+// The client just holds RPC + Jupiter config. Submitter, priority fee, and tip are per swap.
+let client = TradingClient::new(rpc, "https://api.jup.ag", Some(jupiter_api_key));
+
+// Build a request — only what you know. Pool is derived from the mint.
+let trade = Trade::buy(wallet, mint, 1_000_000, 500, Some(Venue::PumpFun)); // 0.001 SOL, 5%
+// venue is Option<Venue>: Some(PumpFun)/Some(PumpSwap), or None → straight to Jupiter
+// (or Trade::sell(wallet, mint, token_amount, slippage_bps, venue))
+
+// Preview
+let quote = client.quote(&trade).await?;        // { in_amount, expected_out, min_out, fee }
+
+// Execute (signer = your Turnkey impl, see §3). Submitter (how it lands, §4) + priority fee
+// are PER swap. The tip rides on the submitter (set it with `.with_tip`, §4).
+let blox = BloxrouteSubmitter::fast(blx_host, blx_auth);          // carries its own tip; reuse across swaps
+let result = client.swap(&trade, &signer, &blox, 50_000).await?;  // { hash, dex, status, amount_received }
+```
+
+That's it. Notes:
+- `amount` is **quote-in** for a buy (SOL lamports / USDC units) and **base tokens** for a sell.
+- The **pool is derived** from the mint per venue. Override for a non-canonical / USDC
+  PumpSwap pool with `Trade::buy(...).with_pool(pool)`.
+- On a **pre-send failure** (e.g. the token graduated off Pump.fun), the client
+  **falls back to Jupiter** automatically. The fallback is **pre-send only** — once the tx
+  is broadcast, a confirmation hiccup is never retried, so it can't double-send. Jupiter
+  isn't a selectable `Venue` — pass `venue: None` to route straight to it.
+- `result.status` is `Confirmed` / `Failed` / `Pending` (didn't confirm before the deadline).
+- Errors come back as a typed **`TradeError`** (§6), not a string — `match` it to pick an HTTP status.
+
+### Submit-now: return the hash before it confirms
+
+`swap` blocks until the tx confirms (or the deadline). For a low-latency response —
+hand back the signature the instant it's broadcast, then check landing separately — use
+`submit` and poll `status(hash)`:
+
+```rust
+use solana_trading_api::SwapStatus;
+
+let pending = client.submit(&trade, &signer, &blox, 50_000).await?; // { hash, dex, status: Pending }
+println!("submitted {} via {}", pending.hash, pending.dex);     // hash + venue known immediately
+
+// later, by hash (e.g. from a GET /swap/status/{hash} endpoint):
+match client.status(&pending.hash).await? {
+    SwapStatus::Confirmed => { /* landed — parse the tx for the fill */ }
+    SwapStatus::Failed    => { /* landed but reverted */ }
+    SwapStatus::Pending   => { /* still in flight — poll again */ }
+}
+```
+
+`submit` skips the confirmation wait **and** the two pre-send balance reads, so it returns
+as fast as the submitter accepts the tx; `amount_received` is `None` (read it off the
+landed tx). `result.dex` is the venue that **actually** built it — `"pumpfun"`,
+`"pumpswap"`, or `"jupiter"` — so it reflects the fallback (a Pump.fun trade that lands via
+Jupiter reports `"jupiter"`). `status` is a single poll at `confirmed` commitment — call it
+until it's no longer `Pending`. Same venue routing + Jupiter fallback as `swap`.
+
+---
+
+## 3. Implement `Signer` with Turnkey
+
+The library hands you an **unsigned** transaction; you return the wallet's signature.
+This is where your Turnkey backend plugs in:
+
+```rust
+use async_trait::async_trait;
+use solana_trading_api::{Signer, Pubkey, Signature, VersionedTransaction};
+
+struct TurnkeySigner { /* turnkey client, sub-org id, signer key, … */ }
+
+#[async_trait]
+impl Signer for TurnkeySigner {
+    async fn sign(&self, wallet: &Pubkey, tx: &VersionedTransaction) -> anyhow::Result<Signature> {
+        // serialize tx.message, call Turnkey `sign_transaction` (type SOLANA, signWith =
+        // wallet, organizationId = that user's sub-org) so your policies apply, return the sig
+        todo!("call turnkey_client here")
+    }
+}
+```
+
+Use `sign_transaction` (not `sign_raw_payload`) so your on-chain policies can inspect the tx.
+
+---
+
+## 4. Choosing the submitter (MEV / non-MEV)
+
+The submitter is the **3rd arg to `swap` / `submit`** — pass one per trade (construct it
+once and reuse, or vary it per request). Pick one:
+
+```rust
+use solana_trading_api::{BloxrouteSubmitter, RpcSubmitter, SubmitProtection};
+
+RpcSubmitter::new(rpc.clone())                       // plain RPC, non-MEV
+BloxrouteSubmitter::fast(host, auth)                 // bloXroute staked RPCs, no protection
+BloxrouteSubmitter::mev(host, auth)                  // front-running protection (SP_MEDIUM)
+    .with_protection(SubmitProtection::High)         //   stronger: wait 8 safe slots
+```
+
+`host` is a regional bloXroute host (e.g. `"http://ny.solana.dex.blxrbdn.com"`); `auth` is
+your Authorization header. `Submitter` is a trait, so more landing paths (Jito, etc.) slot
+into `crate::submit`.
+
+**bloXroute tips are automatic.** Both `fast` and `mev` carry their own tip —
+`BloxrouteSubmitter::DEFAULT_TIP_ACCOUNT` + `MIN_TIP_LAMPORTS` (0.001 SOL) — via
+`Submitter::default_tip` — so it's applied automatically, no per-swap arg. The tip is a real
+transfer out of the wallet, so size the balance for it. Change the amount / rotate wallets on
+the submitter: `BloxrouteSubmitter::fast(host, auth).with_tip(account, lamports)` — vary the
+submitter per trade to vary the tip. Plain `RpcSubmitter` has no tip, so non-MEV sends never tip.
+
+## 5. Priority fee
+
+The last arg to `swap` / `submit` — **per swap** (e.g. bid a fat fee to win a snipe):
+
+```rust
+let result = client.swap(&trade, &signer, &blox, 200_000).await?; // big priority fee for THIS trade
+let result = client.swap(&trade2, &signer, &blox, 50_000).await?; // smaller for the next
+
+client.deadline = std::time::Duration::from_secs(60); // confirmation deadline (default 30s)
+```
+
+- `priority_fee_lamports` is the **total** priority fee, spread across the compute units
+  (sized by a pre-send **simulation**, ×1.2, fallback default). Pass `0` to skip it.
+- The **tip is on the submitter**, not here — it's submitter-specific (account + amount), set
+  with `BloxrouteSubmitter::with_tip` (§4). To vary the tip per trade, vary the submitter.
+
+**Lower level:** the venue builders are public — `dex.swap(&trade)` returns the raw
+`(Vec<Instruction>, Vec<AddressLookupTableAccount>)` for a single venue (no fallback, no send).
+
+---
+
+## 6. Errors
+
+Every fallible call returns `Result<T, TradeError>` — a typed error, not a stringly
+`anyhow` blob. Each `Display` reads as a finished sentence (e.g. `config: invalid jupiter
+URL "…" — relative URL without a base`), and the variants let your API layer map a
+failure to the right HTTP status instead of a blanket 400:
+
+```rust
+use solana_trading_api::TradeError;
+
+fn http_status(e: &TradeError) -> u16 {
+    match e {
+        TradeError::Config { .. }                            => 500, // our misconfig (bad RPC/Jupiter URL)
+        TradeError::Http { .. }                              => 502, // venue API non-2xx (Jupiter/bloXroute)
+        TradeError::Network { .. } | TradeError::Rpc { .. }  => 503, // transport / RPC — retryable
+        TradeError::Sign(_)                                  => 502, // your Signer (Turnkey) failed
+        TradeError::Submit(_)                                => 502, // submitter couldn't land it
+        _                                                    => 400, // Decode / Build / Venue
+    }
+}
+```
+
+Variants: `Config` (bad URL, caught before any request goes out), `Http { venue, status,
+body }`, `Network`, `Rpc { context }`, `Decode`, `Build`, `Venue { venue, msg }` (an
+**on-chain** builder — Pump.fun/PumpSwap — failed), `Sign`, `Submit`.
+
+Jupiter is the fallback and is reached through the same `Dex` path, but **its typed errors
+are preserved** — a Jupiter failure surfaces as `Http` / `Network` / `Config` / `Decode`
+(e.g. a bad key → `Http { venue: "jupiter", status: 401 }`), *not* `Venue`. So your status
+mapper can treat Jupiter HTTP failures as `502` rather than lumping them into the `400`
+catch-all.
+
+If your backend is on `anyhow`, `?` still works — `TradeError` implements
+`std::error::Error`, so the messages just get legible.
+
+---
+
+## 7. Notes / limits
+
+- **Token-2022 handled** — the right token program is detected per mint.
+- **Jupiter needs an API key** (`api.jup.ag`) for the `/swap/v2/build` endpoint;
+  `lite-api.jup.ag` (free) is v1-only.
+- **No cross-quote routing in our own venues** — a USDC-quoted pool needs the user to
+  hold USDC; for "pay SOL for anything", pass `venue: None` (Jupiter routes SOL→token).
+- **Flat fees** (global bps), not tiered — fine for normal sizes.
+- **Confirmation is synchronous-with-deadline**: only `hash` is known at send time;
+  `status` + `amount_received` come from the landed tx.

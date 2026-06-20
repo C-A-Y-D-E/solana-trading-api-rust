@@ -1,0 +1,349 @@
+---
+title: DEX Layer
+description: >
+  The Dex trait and per-venue swap/quote builders (Pump.fun, PumpSwap). This is
+  the living spec for src/dexes — update it whenever the layer changes.
+status: living
+last_updated: 2026-06-18
+---
+
+# DEX Layer
+
+Bottom layer of the trading API. Each venue knows how to **quote** a swap and
+**build the instructions** for it. That's all. No signing, no priority fees, no
+broadcasting — the API layer on top authenticates (Turnkey → wallet pubkey),
+assembles the transaction, signs, and sends.
+
+> **Keep this file current.** Any change to the trait, a venue's account list, an
+> offset, fee math, or an assumption → update the section **and** the [Changelog](#changelog).
+
+---
+
+## Crate shape
+
+A **library** consumed by the user's backend (which owns auth + Turnkey).
+Signing-agnostic — never imports a wallet/auth crate; signing is injected via the
+`Signer` trait. Entry point: `TradingClient` (`client.rs`).
+
+```
+src/
+├── lib.rs            # module decls + flat re-exports
+├── types.rs          # ALL data types + the Dex & Signer traits (Trade, Quote, Tip, Venue, …)
+├── client.rs         # TradingClient — quote() / swap() / swap_with()  ← the entry point
+├── executor.rs       # build_optimal_tx + sign_send_confirm + execute_swap (build→sign→send→confirm)
+├── jupiter.rs        # Jupiter aggregator venue (/swap/v2/build)
+├── submit.rs         # Submitter impls: RpcSubmitter (non-MEV), BloxrouteSubmitter (MEV/fast)
+├── main.rs           # example binary (smoke-test)
+└── dexes/
+    ├── mod.rs        # pub mod common, pumpfun, pumpswap
+    ├── common.rs     # constants, PDA/ATA helpers, hand-built ix, account decode, swap math + fee/slippage
+    ├── pumpfun/{mod.rs, idl.json}    # PumpFun: bonding curve, SOL-native
+    └── pumpswap/{mod.rs, idl.json}   # PumpSwap: AMM, WSOL or USDC quote
+```
+
+Account order / discriminators / offsets are derived from `idl.json` **and
+cross-checked against the official JS SDKs** (`@pump-fun/pump-sdk`,
+`@pump-fun/pump-swap-sdk`) — see [SDK cross-check](#sdk-cross-check) for what that
+caught.
+
+---
+
+## The contract
+
+Callers use `TradingClient` with a `Trade`:
+
+```rust
+let client = TradingClient::new(rpc, "https://api.jup.ag", Some(jup_key));
+let trade  = Trade::buy(wallet, mint, amount, slippage_bps, Some(Venue::PumpFun)); // None → Jupiter
+let quote  = client.quote(&trade).await?;
+let result = client.swap(&trade, &signer).await?;   // default fees+deadline; Jupiter fallback
+```
+
+Core types (`types.rs`):
+
+```rust
+pub enum Side { Buy, Sell }
+pub enum Venue { PumpFun, PumpSwap }   // Jupiter is the universal fallback, not selectable
+
+pub struct Trade {            // the request — only what the caller knows
+    pub wallet: Pubkey, pub mint: Pubkey, pub side: Side,
+    pub amount: u64,          // Buy: quote-in (fee incl). Sell: base tokens.
+    pub slippage_bps: u64, pub venue: Option<Venue>, // None → Jupiter fallback
+    pub pool: Option<Pubkey>, // None → venue derives canonical pool from the mint
+}                             // Trade::buy(..) / Trade::sell(..) / .with_pool(..)
+
+pub struct Quote { in_amount, expected_out, min_out, fee }   // pure numbers
+```
+
+Each venue implements the `Dex` trait (`quote`/`swap(&Trade)`), deriving its own pool
+when `trade.pool` is `None`. Jupiter isn't a `Dex` (HTTP aggregator) — the client
+handles it. Everything venue-specific stays inside each module — `Trade`/`Quote`
+never carry addresses or per-venue flags, so adding a DEX never churns the shared types.
+
+---
+
+## Executor & Signer
+
+`executor::execute_swap` ties a venue's `swap` to a real submission, while keeping
+auth/signing in the caller's backend:
+
+```rust
+#[async_trait]
+pub trait Signer {                                  // implemented by the backend (e.g. Turnkey)
+    async fn sign(&self, wallet: &Pubkey, tx: &VersionedTransaction) -> Result<Signature>;
+}
+
+execute_swap(rpc, dex, signer, params, budget, deadline) -> SwapResult
+// build (compute budget + dex.swap ix) → snapshot output balance → compile v0 tx
+// → signer.sign → broadcast → poll confirm to deadline → diff balance → fill
+```
+
+`SwapResult { hash, dex: &'static str, status: Confirmed|Failed|Pending, amount_received: Option<u64> }`
+(`dex` = the venue that actually built/landed it — reflects the Jupiter fallback).
+Synchronous-with-deadline (see [api-layer-design memory]): only `hash` is known at
+send time; `status` + `amount_received` need the landed tx. `amount_received` is the
+balance delta — base-token ATA for buys (precise), wallet SOL for SOL-quoted sells
+(approximate; USDC-quoted sell fills not captured — TODO).
+
+## Dependencies (why no `solana-sdk`)
+
+We depend on the **granular solana crates**, not the `solana-sdk` meta-crate. The
+meta-crate (4.0.x) bundles the newest component crates (`solana-transaction` 4.0),
+but `solana-client` 4.0.0 still pulls the 3.1 line — mixing them makes
+`VersionedTransaction` two different types (`SerializableTransaction` unsatisfied).
+Per the [anza-xyz/solana-sdk README], the modular crates are versioned
+independently and meant to be used directly. So we pin to solana-client's line:
+`solana-pubkey 4.1`, `solana-instruction 3.3`, `solana-message 3.1`,
+`solana-transaction 3.1`, `solana-signature 3.3`, `solana-commitment-config 3.1`.
+We hand-build System / compute-budget / ATA / token instructions, so we need
+neither `solana-system-interface` nor `-compute-budget-interface`. Account layouts
+are decoded with `borsh` (derive) into named-field structs — `solana-pubkey`'s
+`borsh` feature gives `Pubkey` its decoder.
+
+## Design decisions (and why)
+
+1. **The trait returns instructions (and a quote) — nothing else.** The API layer
+   does compute-budget / sign / broadcast. `swap` → `Vec<Instruction>`,
+   `quote` → numbers for previews.
+
+2. **Shared layer is generic-only; all venue specifics live per-DEX.** Vaults,
+   fee-recipient sets, cashback flags, buyback accounts, PDAs, fee bps — none of
+   that touches `traits.rs`. Each module has a **private** pool view (pumpfun `Curve`,
+   pumpswap `PoolState`) and `FeeSettings` (cached fee config). Adding a new DEX never edits the
+   shared types. This is a hard rule — it's why `PoolInfo`/vaults/`is_cashback`
+   were pulled out of the shared type.
+
+3. **`Side` lives in `SwapParams`**, so there's one `swap` + one `quote` instead of
+   `buy`/`sell`/`quote_buy`/`quote_sell`. `amount`'s meaning is already
+   side-dependent, so side belongs next to it.
+
+4. **Fee recipient is global + cached, picked from a set.** Each DEX loads its
+   global config once (`OnceLock`) and reuses it. We take the primary / index-0
+   recipient; the programs accept any from the allowed set. *TODO: randomize.*
+
+5. **Quotes are fee-aware (flat global bps).** `quote`/`swap` read the protocol +
+   creator (+ lp, on AMM) bps from the cached global config and fold them in, so
+   `min_out` won't be set too high and sells won't fail on the fee. *TODO: tiered
+   fees via `FeeConfig` for exactness on large orders — currently flat.*
+
+6. **WSOL wrap/unwrap is conditional on `quote_mint == WSOL`.** USDC-quoted pools
+   trade straight from the user's USDC ATA — no wrap. (PumpSwap reads `quote_mint`
+   from the pool; Pump.fun is always SOL-native.)
+
+7. **Instructions hand-built from stable IDs** (`common.rs`): System transfer, ATA
+   create-idempotent, `sync_native`, `close_account`. Avoids extra crates (solana-sdk
+   4.x dropped `system_program`/`system_instruction`; `spl_token` builders are deprecated).
+
+---
+
+## Fee-aware quote math
+
+Buys use the **exact-in** instruction variants (`buy_exact_sol_in` /
+`buy_exact_quote_in`): you spend exactly `amount`, and slippage protects the
+**output** — so `min_out = slippage_down(expected_out)` on both sides.
+
+**Pump.fun** (`total_bps = protocol + creator`):
+- Buy (`amount` = gross SOL): `net = (amount−1)·10000/(total_bps+10000)`; `expected_out = base_out_for_quote_in(quote, base, net)`; `fee = amount − net`. ix `buy_exact_sol_in`: `spendable_sol_in = amount`, `min_tokens_out = slippage_down(expected_out)`, `track_volume = 1`.
+- Sell (`amount` = tokens): `gross = quote_out_for_base_in(quote, base, amount)`; `fee = ceil(gross·protocol) + ceil(gross·creator)`; `expected_out = gross − fee`. ix `sell`: `amount`, `min_sol_output = slippage_down(expected_out)`.
+
+**PumpSwap** (`total_bps = lp + protocol + creator`, fees floored):
+- Buy (`amount` = gross quote): `effective = amount·10000/(10000+total_bps)` (clamped so `effective+fees ≤ amount`); `expected_out = base_out_for_quote_in(quote, base, effective−1)`; `fee = amount − effective`. ix `buy_exact_quote_in`: `spendable_quote_in = amount`, `min_base_amount_out = slippage_down(expected_out)`, `track_volume = 1`.
+- Sell (`amount` = base): `gross = quote_out_for_base_in(quote, base, amount)`; `fee = floor(gross·lp) + floor(gross·protocol) + floor(gross·creator)`; `expected_out = gross − fee`. ix `sell`: `amount`, `min_quote_amount_out = slippage_down(expected_out)`.
+
+**Discriminators** are derived from the instruction name via
+`anchor_discriminator(name)` = `sha256("global:" + name)[..8]` (unit-tested against the
+IDLs), so switching a buy variant is a one-line name change. The exact-in buy variants
+are **account-identical** to the legacy `buy` (verified from the IDLs), so the same
+appended remaining accounts apply.
+
+---
+
+## SDK cross-check
+
+Comparing our IDL-derived instructions against the official JS SDKs (June 2026,
+`pump-sdk` 1.36 / `pump-swap-sdk` 1.17) caught accounts the **named IDL list
+doesn't show** but the deployed programs require as appended `remainingAccounts`:
+
+- **Pump.fun buy & sell** append: `["bonding-curve-v2", mint]` (readonly) + a
+  **writable** buyback fee recipient (from a static set; we use the first).
+- **PumpSwap buy & sell** append: `["pool-v2", base_mint]` (readonly, when the pool
+  has a coin creator) + buyback recipient (readonly, from on-chain
+  `GlobalConfig.buyback_fee_recipients`) + its quote ATA (writable). Cashback coins
+  add a volume-accumulator ATA (buy) or that ATA + the accumulator (sell), gated on
+  the pool's `is_cashback`.
+- **`track_volume` is `true`** (1 byte) on both buys.
+
+Without these the current programs reject the transaction.
+
+---
+
+## Constants & account structs
+
+| Thing | Address |
+| --- | --- |
+| Pump.fun program | `6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P` |
+| PumpSwap (pump_amm) | `pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA` |
+| Fee program (both) | `pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ` |
+| WSOL mint | `So11111111111111111111111111111111111111112` |
+| Pump.fun buyback recipient (we use [0]) | `5YxQFdt3Tr9zJLvkFccqXVUwhdTWJQc1fFg2YPbxvxeD` |
+
+Discriminators are not hardcoded — `anchor_discriminator("buy_exact_sol_in")` etc.
+(see [Fee-aware quote math](#fee-aware-quote-math)). Instruction names live as
+`BUY_IX` / `SELL_IX` consts per venue.
+
+**Account decoding:** no byte offsets. Each account is a `#[derive(BorshDeserialize)]`
+struct whose first field is the 8-byte discriminator (`u64`), with the remaining
+fields in IDL order (structs may stop early; `decode_account` reads only the declared
+fields). Read fields by name — `curve.virtual_token_reserves`, `pool.coin_creator`,
+`gc.buyback_fee_recipients[0]` — see `pumpfun::{BondingCurve, Global}` and
+`pumpswap::{Pool, GlobalConfig}`. (`solana-pubkey`'s `borsh` feature gives `Pubkey`
+its decoder.)
+
+PDA seeds:
+
+| DEX | PDA | Seeds (program) |
+| --- | --- | --- |
+| Pump.fun | global / event auth | `["global"]` / `["__event_authority"]` (pump) |
+| | creator vault | `["creator-vault", creator]` (pump) |
+| | global / user volume | `["global_volume_accumulator"]` / `["user_volume_accumulator", user]` (pump) |
+| | bonding curve v2 | `["bonding-curve-v2", mint]` (pump) |
+| | fee config | `["fee_config", PROGRAM_ID]` (fee program; 2nd seed = pump's own pubkey) |
+| PumpSwap | global config / event auth | `["global_config"]` / `["__event_authority"]` (pump_amm) |
+| | coin creator vault auth | `["creator_vault", coin_creator]` (pump_amm) |
+| | global / user volume | `["global_volume_accumulator"]` / `["user_volume_accumulator", user]` (pump_amm) |
+| | pool v2 | `["pool-v2", base_mint]` (pump_amm) |
+| | fee config | `["fee_config", PROGRAM_ID]` (fee program; 2nd seed = pump_amm's own pubkey) |
+
+Typical account counts (creator set, not cashback): **Pump.fun** buy 18 / sell 16.
+**PumpSwap** buy 26 / sell 24.
+
+---
+
+## Assumptions / TODO (verify before mainnet)
+
+- **Flat fees, not tiered.** Quote reads `protocol`/`creator`/`lp` bps from global
+  config; the programs also support `FeeConfig` market-cap tiers we don't model yet.
+- **Fee recipient = index 0** of the set (both protocol and buyback). Consider rotating.
+- **Token-2022 supported.** Each mint's token program is read from its on-chain owner and
+  used for ATA derivation + the ix `token_program` accounts (validated by live simulation;
+  the test token is a Token-2022 mint).
+- **Canonical pools.** PumpSwap reads vaults exactly from the pool account; cashback path
+  is implemented but lightly exercised.
+- **No compute budget / priority fee / tip / confirmation** — all API-layer concerns.
+- Near-graduation Pump.fun buys aren't capped to `real_token_reserves` yet (SDK does `min(...)`).
+
+---
+
+## Usage sketch (API layer)
+
+```rust
+let rpc = Arc::new(RpcClient::new(url));
+let dex: Box<dyn Dex> = match req.venue {
+    Venue::PumpFun  => Box::new(PumpFun::new(rpc.clone())),
+    Venue::PumpSwap => Box::new(PumpSwap::new(rpc.clone())),
+};
+let params = SwapParams {
+    wallet: req.wallet, pool: req.pool, mint: req.mint,
+    side: req.side, amount: req.amount, slippage_bps: req.slippage_bps,
+};
+let preview = dex.quote(&params).await?;        // show the user expected_out / fee
+let (mut ixs, alts) = dex.swap(&params).await?;  // instructions + venue ALTs (empty for pump, set for Jupiter)
+// API layer: prepend compute budget / priority fee, build v0 tx, sign via Turnkey, broadcast.
+```
+
+---
+
+## Changelog
+
+- **2026-06-18 (v12)** — Pluggable **submission**: a `Submitter` trait (in `types.rs`) +
+  `src/submit.rs` with `RpcSubmitter` (non-MEV, default) and `BloxrouteSubmitter`
+  (`POST /api/v2/submit`; `::mev()` = front-running protection, `::fast()` = staked RPCs).
+  The executor's send step takes `&dyn Submitter`; `TradingClient::swap` = RPC,
+  `swap_via(&submitter)` picks one per trade, `swap_with` adds it to the full-control path.
+  New deps: `bincode` (tx wire bytes for bloXroute's base64). More submitters slot into `submit.rs`.
+
+- **2026-06-18 (v11)** — Consumer-ergonomics refactor. Single `Trade` request
+  (`Trade::buy`/`sell`, `venue` inside it, `pool: Option` derived from the mint) replaces
+  `SwapParams` + the separate venue arg + the caller deriving the pool. `Router` →
+  `TradingClient` with `quote(&trade)` / `swap(&trade, signer)` (default `fees`+`deadline`
+  on the client) + `swap_with(...)` for overrides. Consolidated every plain type + the
+  `Dex`/`Signer` traits into `types.rs`; renamed `router.rs` → `client.rs`; removed
+  `dexes/traits.rs`. Behavior unchanged; build clean (0 warnings).
+
+- **2026-06-18 (v10)** — Reworked fees around a shared `executor::build_optimal_tx` (mirrors
+  the user's proven JS): **simulate → CU limit ×1.2** (fallback 350k), then **spread a *total*
+  priority fee** (`Fees { priority_fee_lamports, tip }`) across those units (per-CU price =
+  total·1e6 / cu_limit). Optional `Tip { account, lamports }` added as a transfer (helper:
+  `common::tip`). Unified across all venues incl. Jupiter (its instructions go through the same
+  builder, minus its own compute-budget ix). Renamed `ComputeBudget` → `Fees`. Also:
+  `execute_swap` / `swap_handler` / `Jupiter::execute` now take a `&[AddressLookupTableAccount]`
+  the caller can pass (Jupiter merges it with its own); `AddressLookupTableAccount` re-exported.
+- **2026-06-18 (v9)** — Added **Jupiter** (`src/jupiter.rs`) via the Metis `GET /swap/v2/build`
+  endpoint (quote + raw instructions + ALTs; we assemble a v0 tx, simulate to size CU, sign, send)
+  and a **`Router`** (`src/router.rs`) with `quote_handler` / `swap_handler(venue, …)` that picks
+  PumpFun / PumpSwap / Jupiter and falls back to Jupiter on a pre-send error. Jupiter isn't a
+  `Dex` (it's an HTTP aggregator returning a full instruction set + ALTs), so the router works at
+  the execute level. New deps: `reqwest`, `serde`, `base64`. `api.jup.ag` needs `x-api-key`.
+- **2026-06-18 (v8)** — Library-consumption polish: flat crate-root re-exports
+  (`PumpFun`/`SwapParams`/`execute_swap`/`Signer`/… plus the solana types callers need,
+  so the backend doesn't add solana crates and can't hit version skew); `publish = false`;
+  added a live end-to-end `tests/live_buy.rs` (`execute_swap` with a local-keypair `Signer`
+  from `.env`, gitignored). Usage guide: `docs/usage.mdx`.
+- **2026-06-18 (v7)** — Token-2022 support + live simulation tests. Each mint's token
+  program is detected from its on-chain owner (`ata`/`create_ata_idempotent` now take the
+  token program) and used for ATAs + the ix `token_program` accounts. Added `#[ignore]`d
+  mainnet tests: quote (both venues) and a `simulate_buy` that validates the real buy via
+  `simulateTransaction`. Simulation caught that the test token is Token-2022 (classic-only
+  would've failed on-chain); after the fix it simulates clean (`err=None`). Added the
+  `PumpFun::bonding_curve_pda` / `PumpSwap::canonical_pool_pda` helpers (mint → pool).
+- **2026-06-18 (v6)** — Naming pass for readability: `cp_base_out`/`cp_quote_out` →
+  `base_out_for_quote_in`/`quote_out_for_base_in`; PDA-deriving methods now end in `_pda`;
+  on-chain account structs suffixed `…Account` (`BondingCurveAccount`/`GlobalAccount`/
+  `PoolAccount`/`GlobalConfigAccount`); cached `Globals` → `FeeSettings`; `fetch` →
+  `load_curve`/`load_pool`; `quote_from` → `compute_quote`; `FEE_PROGRAM` → `FEE_PROGRAM_ID`;
+  clearer locals (`sol_into_curve`, `gross_quote_out`, `wrap_sol`, …). Behavior unchanged.
+- **2026-06-18 (v5)** — Discriminators derived from instruction names via
+  `anchor_discriminator(name)` (sha256, unit-tested vs the IDLs) instead of hardcoded
+  byte arrays (added `sha2`). Switched buys to the exact-in variants
+  (`buy_exact_sol_in` / `buy_exact_quote_in`) — spend exactly `amount`, slippage now
+  protects the output, so `Quote.min_out = slippage_down(expected_out)` for buys too.
+  Account lists unchanged (exact-in variants are account-identical to legacy `buy`).
+- **2026-06-18 (v4)** — Readability pass: account data is now decoded into
+  `#[derive(BorshDeserialize)]` named-field structs (`BondingCurve`/`Global`/`Pool`/
+  `GlobalConfig`) instead of hardcoded byte offsets — read `pool.coin_creator`, not
+  `read_pubkey(data, 211)`. `fee_config` PDA now derives its second seed from
+  `PROGRAM_ID` (it's the program's own pubkey) instead of a hardcoded 32-byte array.
+  Restored `borsh` (with derive) + `solana-pubkey` `borsh` feature.
+- **2026-06-18 (v3)** — Restructured as a **library** (`lib.rs` + `executor`) consumed
+  by the user's existing backend; the crate is signing-agnostic via `executor::Signer`.
+  Added `execute_swap` (build→sign→broadcast→confirm→parse, synchronous-with-deadline,
+  returns `{hash, status, amount_received}`). Dropped the `solana-sdk` meta-crate for the
+  granular crates pinned to `solana-client` 4.0's line, fixing a `VersionedTransaction`
+  type skew. Builds clean (0 warnings).
+- **2026-06-18 (v2)** — Redesigned per design review: trait is now `name`/`quote`/`swap`
+  with `Side` in `SwapParams`; deleted the shared `PoolInfo` (vaults/cashback/etc. moved
+  into each DEX's private `PoolState`); added `Quote` (pure numbers); fee-aware quoting
+  (flat global bps); cached global config per DEX. Cross-checked both official JS SDKs and
+  added the required appended accounts (bonding-curve-v2 / pool-v2 / buyback / cashback) and
+  `track_volume = true`. Builds clean on solana-sdk 4.0.1.
+- **2026-06-18 (v1)** — Initial layer: `Dex` trait, `PoolInfo`, `get_pool`/`buy`/`sell`.
