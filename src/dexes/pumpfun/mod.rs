@@ -30,6 +30,8 @@ struct BondingCurveAccount {
     token_total_supply: u64,
     complete: bool,
     creator: Pubkey,
+    is_mayhem_mode: bool,
+    is_cashback_coin: bool,
 }
 
 #[derive(BorshDeserialize)]
@@ -62,6 +64,7 @@ struct Curve {
     base_reserves: u64,
     quote_reserves: u64,
     real_token_reserves: u64,
+    is_cashback: bool,
     token_program: Pubkey,
 }
 
@@ -142,6 +145,7 @@ impl PumpFun {
             base_reserves: c.virtual_token_reserves,
             quote_reserves: c.virtual_quote_reserves,
             real_token_reserves: c.real_token_reserves,
+            is_cashback: c.is_cashback_coin,
             token_program: mint_acc.owner,
         })
     }
@@ -247,26 +251,36 @@ impl PumpFun {
         data.extend_from_slice(&anchor_discriminator(SELL_IX));
         data.extend_from_slice(&base_in.to_le_bytes());
         data.extend_from_slice(&min_sol.to_le_bytes());
+        let mut accounts = vec![
+            AccountMeta::new_readonly(Self::global_pda(), false),
+            AccountMeta::new(fee_recipient, false),
+            AccountMeta::new_readonly(p.mint, false),
+            AccountMeta::new(pool, false),
+            AccountMeta::new(ata(&pool, &p.mint, &curve.token_program), false),
+            AccountMeta::new(ata(&p.wallet, &p.mint, &curve.token_program), false),
+            AccountMeta::new(p.wallet, true),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM, false),
+            AccountMeta::new(Self::creator_vault_pda(&curve.creator), false),
+            AccountMeta::new_readonly(curve.token_program, false),
+            AccountMeta::new_readonly(Self::event_authority_pda(), false),
+            AccountMeta::new_readonly(PROGRAM_ID, false),
+            AccountMeta::new_readonly(Self::fee_config_pda(), false),
+            AccountMeta::new_readonly(FEE_PROGRAM_ID, false),
+        ];
+        // Cashback coins require the user volume accumulator at remaining_accounts[0],
+        // before bonding_curve_v2 — anything else there fails with 6073
+        // (InvalidCashbackAccumulator).
+        if curve.is_cashback {
+            accounts.push(AccountMeta::new(Self::user_volume_pda(&p.wallet), false));
+        }
+        accounts.push(AccountMeta::new_readonly(
+            Self::bonding_curve_v2_pda(&p.mint),
+            false,
+        ));
+        accounts.push(AccountMeta::new(BUYBACK_RECIPIENT, false));
         Instruction {
             program_id: PROGRAM_ID,
-            accounts: vec![
-                AccountMeta::new_readonly(Self::global_pda(), false),
-                AccountMeta::new(fee_recipient, false),
-                AccountMeta::new_readonly(p.mint, false),
-                AccountMeta::new(pool, false),
-                AccountMeta::new(ata(&pool, &p.mint, &curve.token_program), false),
-                AccountMeta::new(ata(&p.wallet, &p.mint, &curve.token_program), false),
-                AccountMeta::new(p.wallet, true),
-                AccountMeta::new_readonly(SYSTEM_PROGRAM, false),
-                AccountMeta::new(Self::creator_vault_pda(&curve.creator), false),
-                AccountMeta::new_readonly(curve.token_program, false),
-                AccountMeta::new_readonly(Self::event_authority_pda(), false),
-                AccountMeta::new_readonly(PROGRAM_ID, false),
-                AccountMeta::new_readonly(Self::fee_config_pda(), false),
-                AccountMeta::new_readonly(FEE_PROGRAM_ID, false),
-                AccountMeta::new_readonly(Self::bonding_curve_v2_pda(&p.mint), false),
-                AccountMeta::new(BUYBACK_RECIPIENT, false),
-            ],
+            accounts,
             data,
         }
     }

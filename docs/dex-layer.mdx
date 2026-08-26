@@ -181,11 +181,16 @@ appended remaining accounts apply.
 ## SDK cross-check
 
 Comparing our IDL-derived instructions against the official JS SDKs (June 2026,
-`pump-sdk` 1.36 / `pump-swap-sdk` 1.17) caught accounts the **named IDL list
+`pump-sdk` 1.36 / `pump-swap-sdk` 1.17; cashback sell rules re-verified against
+`pump-rust-client` 0.1.9, Aug 2026) caught accounts the **named IDL list
 doesn't show** but the deployed programs require as appended `remainingAccounts`:
 
 - **Pump.fun buy & sell** append: `["bonding-curve-v2", mint]` (readonly) + a
-  **writable** buyback fee recipient (from a static set; we use the first).
+  **writable** buyback fee recipient (from a static set; we use the first). On
+  **sell**, cashback coins (curve `is_cashback_coin`) additionally require the
+  **user volume accumulator** (writable) as `remaining_accounts[0]`, before
+  bonding-curve-v2 — anything else in that slot fails with 6073
+  `InvalidCashbackAccumulator`. Buy already carries it in the named list.
 - **PumpSwap buy & sell** append: `["pool-v2", base_mint]` (readonly, when the pool
   has a coin creator) + buyback recipient (readonly, from on-chain
   `GlobalConfig.buyback_fee_recipients`) + its quote ATA (writable). Cashback coins
@@ -234,8 +239,8 @@ PDA seeds:
 | | pool v2 | `["pool-v2", base_mint]` (pump_amm) |
 | | fee config | `["fee_config", PROGRAM_ID]` (fee program; 2nd seed = pump_amm's own pubkey) |
 
-Typical account counts (creator set, not cashback): **Pump.fun** buy 18 / sell 16.
-**PumpSwap** buy 26 / sell 24.
+Typical account counts (creator set, not cashback): **Pump.fun** buy 18 / sell 16
+(17 for cashback-coin sells). **PumpSwap** buy 26 / sell 24.
 
 ---
 

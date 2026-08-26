@@ -132,13 +132,19 @@ impl TradingClient {
             .rpc
             .get_account(mint)
             .await
-            .map_err(|source| TradeError::Rpc { context: "get_account(mint)", source })?;
+            .map_err(|source| TradeError::Rpc {
+                context: "get_account(mint)",
+                source,
+            })?;
         let token_account = ata(wallet, mint, &mint_acc.owner);
         let bal = self
             .rpc
             .get_token_account_balance(&token_account)
             .await
-            .map_err(|source| TradeError::Rpc { context: "token balance", source })?;
+            .map_err(|source| TradeError::Rpc {
+                context: "token balance",
+                source,
+            })?;
         bal.amount
             .parse()
             .map_err(|_| TradeError::Decode("client", format!("bad token amount {}", bal.amount)))
