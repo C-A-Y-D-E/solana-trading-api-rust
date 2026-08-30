@@ -186,7 +186,9 @@ Comparing our IDL-derived instructions against the official JS SDKs (June 2026,
 doesn't show** but the deployed programs require as appended `remainingAccounts`:
 
 - **Pump.fun buy & sell** append: `["bonding-curve-v2", mint]` (readonly) + a
-  **writable** buyback fee recipient (from a static set; we use the first). On
+  **writable** buyback fee recipient (we use the first address in the on-chain
+  `Global.buyback_fee_recipients`). The named fee-recipient account is selected
+  from the normal set or the reserved set according to `curve.is_mayhem_mode`. On
   **sell**, cashback coins (curve `is_cashback_coin`) additionally require the
   **user volume accumulator** (writable) as `remaining_accounts[0]`, before
   bonding-curve-v2 — anything else in that slot fails with 6073
@@ -210,8 +212,6 @@ Without these the current programs reject the transaction.
 | PumpSwap (pump_amm) | `pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA` |
 | Fee program (both) | `pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ` |
 | WSOL mint | `So11111111111111111111111111111111111111112` |
-| Pump.fun buyback recipient (we use [0]) | `5YxQFdt3Tr9zJLvkFccqXVUwhdTWJQc1fFg2YPbxvxeD` |
-
 Discriminators are not hardcoded — `anchor_discriminator("buy_exact_sol_in")` etc.
 (see [Fee-aware quote math](#fee-aware-quote-math)). Instruction names live as
 `BUY_IX` / `SELL_IX` consts per venue.

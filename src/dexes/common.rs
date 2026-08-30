@@ -139,7 +139,7 @@ pub fn fee_floor(amount: u64, bps: u64) -> u64 {
 }
 
 pub fn fee_ceil(amount: u64, bps: u64) -> u64 {
-    ((amount as u128 * bps as u128 + 9_999) / 10_000) as u64
+    (amount as u128 * bps as u128).div_ceil(10_000) as u64
 }
 
 pub fn slippage_up(x: u64, bps: u64) -> u64 {

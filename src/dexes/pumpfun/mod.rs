@@ -14,8 +14,6 @@ use crate::types::{Dex, Quote, Side, Trade};
 pub const PROGRAM_ID: Pubkey = pubkey!("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
 pub const FEE_PROGRAM_ID: Pubkey = pubkey!("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ");
 
-const BUYBACK_RECIPIENT: Pubkey = pubkey!("5YxQFdt3Tr9zJLvkFccqXVUwhdTWJQc1fFg2YPbxvxeD");
-
 const BUY_IX: &str = "buy_exact_sol_in";
 const SELL_IX: &str = "sell";
 
@@ -50,13 +48,35 @@ struct GlobalAccount {
     enable_migrate: bool,
     pool_migration_fee: u64,
     creator_fee_basis_points: u64,
+    fee_recipients: [Pubkey; 7],
+    set_creator_authority: Pubkey,
+    admin_set_creator_authority: Pubkey,
+    create_v2_enabled: bool,
+    whitelist_pda: Pubkey,
+    reserved_fee_recipient: Pubkey,
+    mayhem_mode_enabled: bool,
+    reserved_fee_recipients: [Pubkey; 7],
+    is_cashback_enabled: bool,
+    buyback_fee_recipients: [Pubkey; 8],
 }
 
 #[derive(Clone, Copy)]
 struct FeeSettings {
-    recipient: Pubkey,
+    standard_recipient: Pubkey,
+    mayhem_recipient: Pubkey,
+    buyback_recipient: Pubkey,
     protocol_bps: u64,
     creator_bps: u64,
+}
+
+impl FeeSettings {
+    fn recipient(self, is_mayhem: bool) -> Pubkey {
+        if is_mayhem {
+            self.mayhem_recipient
+        } else {
+            self.standard_recipient
+        }
+    }
 }
 
 struct Curve {
@@ -64,6 +84,7 @@ struct Curve {
     base_reserves: u64,
     quote_reserves: u64,
     real_token_reserves: u64,
+    is_mayhem: bool,
     is_cashback: bool,
     token_program: Pubkey,
 }
@@ -114,7 +135,9 @@ impl PumpFun {
         let acc = self.rpc.get_account(&Self::global_pda()).await?;
         let global: GlobalAccount = decode_account(&acc.data)?;
         let f = FeeSettings {
-            recipient: global.fee_recipient,
+            standard_recipient: global.fee_recipient,
+            mayhem_recipient: global.reserved_fee_recipient,
+            buyback_recipient: global.buyback_fee_recipients[0],
             protocol_bps: global.fee_basis_points,
             creator_bps: global.creator_fee_basis_points,
         };
@@ -145,6 +168,7 @@ impl PumpFun {
             base_reserves: c.virtual_token_reserves,
             quote_reserves: c.virtual_quote_reserves,
             real_token_reserves: c.real_token_reserves,
+            is_mayhem: c.is_mayhem_mode,
             is_cashback: c.is_cashback_coin,
             token_program: mint_acc.owner,
         })
@@ -203,7 +227,7 @@ impl PumpFun {
         p: &Trade,
         pool: Pubkey,
         curve: &Curve,
-        fee_recipient: Pubkey,
+        fees: FeeSettings,
         spendable_sol: u64,
         min_tokens: u64,
     ) -> Instruction {
@@ -216,7 +240,7 @@ impl PumpFun {
             program_id: PROGRAM_ID,
             accounts: vec![
                 AccountMeta::new_readonly(Self::global_pda(), false),
-                AccountMeta::new(fee_recipient, false),
+                AccountMeta::new(fees.recipient(curve.is_mayhem), false),
                 AccountMeta::new_readonly(p.mint, false),
                 AccountMeta::new(pool, false),
                 AccountMeta::new(ata(&pool, &p.mint, &curve.token_program), false),
@@ -232,7 +256,7 @@ impl PumpFun {
                 AccountMeta::new_readonly(Self::fee_config_pda(), false),
                 AccountMeta::new_readonly(FEE_PROGRAM_ID, false),
                 AccountMeta::new_readonly(Self::bonding_curve_v2_pda(&p.mint), false),
-                AccountMeta::new(BUYBACK_RECIPIENT, false),
+                AccountMeta::new(fees.buyback_recipient, false),
             ],
             data,
         }
@@ -243,7 +267,7 @@ impl PumpFun {
         p: &Trade,
         pool: Pubkey,
         curve: &Curve,
-        fee_recipient: Pubkey,
+        fees: FeeSettings,
         base_in: u64,
         min_sol: u64,
     ) -> Instruction {
@@ -253,7 +277,7 @@ impl PumpFun {
         data.extend_from_slice(&min_sol.to_le_bytes());
         let mut accounts = vec![
             AccountMeta::new_readonly(Self::global_pda(), false),
-            AccountMeta::new(fee_recipient, false),
+            AccountMeta::new(fees.recipient(curve.is_mayhem), false),
             AccountMeta::new_readonly(p.mint, false),
             AccountMeta::new(pool, false),
             AccountMeta::new(ata(&pool, &p.mint, &curve.token_program), false),
@@ -277,7 +301,7 @@ impl PumpFun {
             Self::bonding_curve_v2_pda(&p.mint),
             false,
         ));
-        accounts.push(AccountMeta::new(BUYBACK_RECIPIENT, false));
+        accounts.push(AccountMeta::new(fees.buyback_recipient, false));
         Instruction {
             program_id: PROGRAM_ID,
             accounts,
@@ -311,10 +335,10 @@ impl Dex for PumpFun {
         let instructions = match p.side {
             Side::Buy => vec![
                 create_ata_idempotent(&p.wallet, &p.wallet, &p.mint, &curve.token_program),
-                self.buy_ix(p, pool, &curve, fees.recipient, p.amount, quote.min_out),
+                self.buy_ix(p, pool, &curve, fees, p.amount, quote.min_out),
             ],
             Side::Sell => {
-                vec![self.sell_ix(p, pool, &curve, fees.recipient, p.amount, quote.min_out)]
+                vec![self.sell_ix(p, pool, &curve, fees, p.amount, quote.min_out)]
             }
         };
         Ok((instructions, vec![]))
@@ -325,6 +349,32 @@ impl Dex for PumpFun {
 mod tests {
     use super::*;
     use crate::types::Venue;
+
+    #[test]
+    fn derives_user_volume_accumulator_from_trading_wallet() {
+        let wallet: Pubkey = "BwuECfotadkbcPqcjjFJfY4khc1MHtLiC3B4gMW1gx5z"
+            .parse()
+            .unwrap();
+
+        assert_eq!(
+            PumpFun::user_volume_pda(&wallet).to_string(),
+            "2RaTH6dUbkGL5trjw4JrAPBNR6iAuMCmzBqf3TPibYUr"
+        );
+    }
+
+    #[test]
+    fn selects_reserved_fee_recipient_for_mayhem_curve() {
+        let fees = FeeSettings {
+            standard_recipient: PROGRAM_ID,
+            mayhem_recipient: FEE_PROGRAM_ID,
+            buyback_recipient: Pubkey::default(),
+            protocol_bps: 0,
+            creator_bps: 0,
+        };
+
+        assert_eq!(fees.recipient(false), PROGRAM_ID);
+        assert_eq!(fees.recipient(true), FEE_PROGRAM_ID);
+    }
 
     #[tokio::test]
     #[ignore = "live mainnet RPC"]
@@ -369,12 +419,12 @@ mod tests {
             "https://api.mainnet-beta.solana.com".to_string(),
         ));
         let dex = PumpFun::new(rpc.clone());
-        let mint: Pubkey = "9JihXt4NZtZzURoMm1KrGN6y2a9LH9xdKkh5p9kJpump"
+        let mint: Pubkey = "FTNTb1NQeQsizRVmqdc9QrD1oQApyzBB9oGJZwdVpump"
             .parse()
             .unwrap();
-        let pool = PumpFun::bonding_curve_pda(&mint);
-
-        let wallet = dex.load_curve(&pool, &mint).await.unwrap().creator;
+        let wallet: Pubkey = "BwuECfotadkbcPqcjjFJfY4khc1MHtLiC3B4gMW1gx5z"
+            .parse()
+            .unwrap();
 
         let params = Trade::buy(wallet, mint, 1_000_000, 500, Some(Venue::PumpFun));
 
