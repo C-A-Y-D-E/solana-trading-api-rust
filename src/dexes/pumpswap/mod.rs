@@ -58,11 +58,22 @@ struct GlobalConfigAccount {
 
 #[derive(Clone, Copy)]
 struct FeeSettings {
-    protocol_recipient: Pubkey,
+    standard_protocol_recipient: Pubkey,
+    mayhem_protocol_recipient: Pubkey,
     buyback_recipient: Pubkey,
     lp_bps: u64,
     protocol_bps: u64,
     creator_bps: u64,
+}
+
+impl FeeSettings {
+    fn protocol_recipient(self, is_mayhem: bool) -> Pubkey {
+        if is_mayhem {
+            self.mayhem_protocol_recipient
+        } else {
+            self.standard_protocol_recipient
+        }
+    }
 }
 
 struct PoolState {
@@ -73,6 +84,7 @@ struct PoolState {
     quote_vault: Pubkey,
     base_reserves: u64,
     quote_reserves: u64,
+    is_mayhem: bool,
     is_cashback: bool,
 
     base_token_program: Pubkey,
@@ -135,7 +147,8 @@ impl PumpSwap {
         let acc = self.rpc.get_account(&Self::global_config_pda()).await?;
         let gc: GlobalConfigAccount = decode_account(&acc.data)?;
         let f = FeeSettings {
-            protocol_recipient: gc.protocol_fee_recipients[0],
+            standard_protocol_recipient: gc.protocol_fee_recipients[0],
+            mayhem_protocol_recipient: gc.reserved_fee_recipient,
             buyback_recipient: gc.buyback_fee_recipients[0],
             lp_bps: gc.lp_fee_basis_points,
             protocol_bps: gc.protocol_fee_basis_points,
@@ -182,6 +195,7 @@ impl PumpSwap {
             quote_vault: pool.pool_quote_token_account,
             base_reserves: base_balance.amount.parse()?,
             quote_reserves: quote_balance.amount.parse()?,
+            is_mayhem: pool.is_mayhem_mode,
             is_cashback: pool.is_cashback_coin,
             base_token_program,
             quote_token_program,
@@ -248,9 +262,10 @@ impl PumpSwap {
         p: &Trade,
         pool_address: Pubkey,
         pool: &PoolState,
-        protocol_recipient: Pubkey,
+        fees: FeeSettings,
     ) -> Vec<AccountMeta> {
         let creator_vault_authority = Self::coin_creator_vault_authority_pda(&pool.coin_creator);
+        let protocol_recipient = fees.protocol_recipient(pool.is_mayhem);
         vec![
             AccountMeta::new(pool_address, false),
             AccountMeta::new(p.wallet, true),
@@ -359,7 +374,7 @@ impl Dex for PumpSwap {
         let wrap_sol = pool.quote_mint == WSOL;
         let user_quote_ata = ata(&p.wallet, &pool.quote_mint, &pool.quote_token_program);
 
-        let mut accounts = self.named_accounts(p, pool_address, &pool, fees.protocol_recipient);
+        let mut accounts = self.named_accounts(p, pool_address, &pool, fees);
         if p.side == Side::Buy {
             accounts.push(AccountMeta::new_readonly(Self::global_volume_pda(), false));
             accounts.push(AccountMeta::new(Self::user_volume_pda(&p.wallet), false));
@@ -439,6 +454,21 @@ mod tests {
     use super::*;
     use crate::types::Venue;
 
+    #[test]
+    fn selects_reserved_protocol_recipient_for_mayhem_pool() {
+        let fees = FeeSettings {
+            standard_protocol_recipient: PROGRAM_ID,
+            mayhem_protocol_recipient: FEE_PROGRAM_ID,
+            buyback_recipient: Pubkey::default(),
+            lp_bps: 0,
+            protocol_bps: 0,
+            creator_bps: 0,
+        };
+
+        assert_eq!(fees.protocol_recipient(false), PROGRAM_ID);
+        assert_eq!(fees.protocol_recipient(true), FEE_PROGRAM_ID);
+    }
+
     #[tokio::test]
     #[ignore = "live mainnet RPC"]
     async fn quote_buy_1_sol() {
@@ -470,5 +500,58 @@ mod tests {
                 "pumpswap: no quote (not a canonical WSOL pool, or still on the curve): {e}"
             ),
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "live mainnet RPC"]
+    async fn simulate_mayhem_buy() {
+        use solana_client::rpc_config::RpcSimulateTransactionConfig;
+        use solana_message::{VersionedMessage, v0};
+        use solana_signature::Signature;
+        use solana_transaction::versioned::VersionedTransaction;
+
+        let rpc = Arc::new(RpcClient::new(
+            "https://api.mainnet-beta.solana.com".to_string(),
+        ));
+        let dex = PumpSwap::new(rpc.clone());
+        let mint: Pubkey = "HXTaBKp2qa5n2DAzzc949tAJMmuVyRoCQCDNkFKkpump"
+            .parse()
+            .unwrap();
+        let pool: Pubkey = "7aN5B42L5bLTvxoGLCScdqU46o4C1j4zKxmjjrmwQKuR"
+            .parse()
+            .unwrap();
+        let wallet: Pubkey = "7a1xV8pUaJbUMqGVC3Z2NQbhW5pBJT2UXfiSFtuUC18S"
+            .parse()
+            .unwrap();
+
+        assert!(dex.load_pool(&pool, &mint).await.unwrap().is_mayhem);
+
+        let params = Trade::buy(wallet, mint, 100_000, 500, Some(Venue::PumpSwap)).with_pool(pool);
+        let mut instructions = vec![set_compute_unit_limit(350_000), set_compute_unit_price(0)];
+        instructions.extend(dex.swap(&params).await.unwrap().0);
+
+        let blockhash = rpc.get_latest_blockhash().await.unwrap();
+        let msg = v0::Message::try_compile(&wallet, &instructions, &[], blockhash).unwrap();
+        let tx = VersionedTransaction {
+            signatures: vec![Signature::default()],
+            message: VersionedMessage::V0(msg),
+        };
+        let simulation = rpc
+            .simulate_transaction_with_config(
+                &tx,
+                RpcSimulateTransactionConfig {
+                    sig_verify: false,
+                    replace_recent_blockhash: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .value;
+
+        for log in simulation.logs.unwrap_or_default() {
+            println!("  {log}");
+        }
+        assert_eq!(simulation.err, None);
     }
 }

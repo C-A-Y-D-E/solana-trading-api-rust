@@ -197,7 +197,8 @@ doesn't show** but the deployed programs require as appended `remainingAccounts`
   has a coin creator) + buyback recipient (readonly, from on-chain
   `GlobalConfig.buyback_fee_recipients`) + its quote ATA (writable). Cashback coins
   add a volume-accumulator ATA (buy) or that ATA + the accumulator (sell), gated on
-  the pool's `is_cashback`.
+  the pool's `is_cashback`. The named protocol-fee recipient and its quote ATA use
+  the reserved recipient when `pool.is_mayhem_mode` is set.
 - **`track_volume` is `true`** (1 byte) on both buys.
 
 Without these the current programs reject the transaction.
