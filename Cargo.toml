@@ -1,6 +1,6 @@
 [package]
 name = "solana-trading-api"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 # never publish to crates.io — this stays private (consumed via private git / path dep)
 publish = false
