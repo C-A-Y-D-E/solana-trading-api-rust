@@ -8,7 +8,7 @@ pub mod types;
 
 pub use client::TradingClient;
 pub use dexes::pumpfun::PumpFun;
-pub use dexes::pumpswap::PumpSwap;
+pub use dexes::pumpswap::{DEFAULT_SOL_USDC_POOL, PumpSwap, USDC_MINT};
 pub use error::{Result, TradeError};
 pub use jupiter::Jupiter;
 pub use submit::{BloxrouteSubmitter, RpcSubmitter, SubmitProtection};

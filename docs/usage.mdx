@@ -62,15 +62,49 @@ let result = client.swap(&trade, &signer, &blox, 50_000).await?;  // { hash, dex
 ```
 
 That's it. Notes:
-- `amount` is **quote-in** for a buy (SOL lamports / USDC units) and **base tokens** for a sell.
+- `amount` is **SOL lamports** for a buy and **base tokens** for a sell. PumpSwap
+  automatically bridges through USDC when the selected pool is USDC-quoted.
 - The **pool is derived** from the mint per venue. Override for a non-canonical / USDC
   PumpSwap pool with `Trade::buy(...).with_pool(pool)`.
-- On a **pre-send failure** (e.g. the token graduated off Pump.fun), the client
-  **falls back to Jupiter** automatically. The fallback is **pre-send only** — once the tx
-  is broadcast, a confirmation hiccup is never retried, so it can't double-send. Jupiter
-  isn't a selectable `Venue` — pass `venue: None` to route straight to it.
+- On a **Pump.fun pre-send failure** (e.g. the token graduated), the client
+  **falls back to Jupiter** automatically. PumpSwap never uses Jupiter. The fallback is
+  **pre-send only** — once the tx is broadcast, a confirmation hiccup is never retried,
+  so it can't double-send. Jupiter isn't a selectable `Venue` — pass `venue: None` to
+  route straight to it.
 - `result.status` is `Confirmed` / `Failed` / `Pending` (didn't confirm before the deadline).
 - Errors come back as a typed **`TradeError`** (§6), not a string — `match` it to pick an HTTP status.
+
+### SOL-funded buy from a USDC PumpSwap pool
+
+Use the two-hop PumpSwap route when the target pool accepts USDC but the user is
+paying with SOL:
+
+```rust
+let trade = Trade::buy(wallet, mint, 1_000_000, 500, Some(Venue::PumpSwap))
+    .with_pool(usdc_target_pool);
+
+let quote = client.quote(&trade).await?;
+let result = client
+    .swap_with_lookup_tables(
+        &trade,
+        &signer,
+        &blox,
+        50_000,
+        &pumpswap_route_lookup_tables,
+    )
+    .await?;
+```
+
+The pool's on-chain `quote_mint` selects this route automatically. `amount` is
+the maximum SOL spend in lamports. It atomically buys
+an exact amount of USDC from the configured PumpSwap USDC/WSOL pool, then spends
+all of that USDC in the target pool. This route never falls back to Jupiter.
+
+The two PumpSwap instructions exceed Solana's packet size without address
+compression. Pass one or more on-chain address lookup tables containing the
+shared PumpSwap accounts and pool accounts; oversized transactions return a
+build error before signing. The default bridge pool is `DEFAULT_SOL_USDC_POOL`
+and can be replaced with `TradingClient::with_pumpswap_sol_usdc_pool`.
 
 ### Submit-now: return the hash before it confirms
 

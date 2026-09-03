@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_message::AddressLookupTableAccount;
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
 
@@ -37,6 +38,12 @@ impl TradingClient {
         }
     }
 
+    /// Replaces the default PumpSwap USDC/WSOL bridge pool used by routed buys.
+    pub fn with_pumpswap_sol_usdc_pool(mut self, pool: Pubkey) -> Self {
+        self.pumpswap = self.pumpswap.with_sol_usdc_pool(pool);
+        self
+    }
+
     pub async fn quote(&self, t: &Trade) -> Result<Quote> {
         let primary = match t.venue {
             Some(Venue::PumpFun) => venue_err("pumpfun", self.pumpfun.quote(t).await),
@@ -45,7 +52,7 @@ impl TradingClient {
         };
         match primary {
             Ok(q) => Ok(q),
-            Err(e) if t.venue.is_some() => {
+            Err(e) if allows_jupiter_fallback(t.venue) => {
                 eprintln!(
                     "trading-client: {:?} quote failed ({e}); falling back to Jupiter",
                     t.venue
@@ -63,10 +70,23 @@ impl TradingClient {
         submitter: &dyn Submitter,
         priority_fee_lamports: u64,
     ) -> Result<SwapResult> {
+        self.swap_with_lookup_tables(t, signer, submitter, priority_fee_lamports, &[])
+            .await
+    }
+
+    /// Executes a swap with additional on-chain address lookup tables.
+    pub async fn swap_with_lookup_tables(
+        &self,
+        t: &Trade,
+        signer: &dyn Signer,
+        submitter: &dyn Submitter,
+        priority_fee_lamports: u64,
+        lookup_tables: &[AddressLookupTableAccount],
+    ) -> Result<SwapResult> {
         let before = output_balance(&self.rpc, t).await;
 
         let pending = self
-            .submit(t, signer, submitter, priority_fee_lamports)
+            .submit_with_lookup_tables(t, signer, submitter, priority_fee_lamports, lookup_tables)
             .await?;
         let sig = pending
             .hash
@@ -94,14 +114,37 @@ impl TradingClient {
         submitter: &dyn Submitter,
         priority_fee_lamports: u64,
     ) -> Result<SwapResult> {
+        self.submit_with_lookup_tables(t, signer, submitter, priority_fee_lamports, &[])
+            .await
+    }
+
+    /// Submits a swap with additional on-chain address lookup tables.
+    pub async fn submit_with_lookup_tables(
+        &self,
+        t: &Trade,
+        signer: &dyn Signer,
+        submitter: &dyn Submitter,
+        priority_fee_lamports: u64,
+        lookup_tables: &[AddressLookupTableAccount],
+    ) -> Result<SwapResult> {
         let dex: &dyn Dex = match t.venue {
             Some(Venue::PumpFun) => &self.pumpfun,
             Some(Venue::PumpSwap) => &self.pumpswap,
             None => &self.jupiter,
         };
-        match submit_swap(&self.rpc, dex, signer, submitter, t, priority_fee_lamports).await {
+        match submit_swap(
+            &self.rpc,
+            dex,
+            signer,
+            submitter,
+            t,
+            priority_fee_lamports,
+            lookup_tables,
+        )
+        .await
+        {
             Ok(r) => Ok(r),
-            Err(e) if t.venue.is_some() => {
+            Err(e) if allows_jupiter_fallback(t.venue) => {
                 eprintln!(
                     "trading-client: {:?} pre-send failed ({e}); falling back to Jupiter",
                     t.venue
@@ -113,6 +156,7 @@ impl TradingClient {
                     submitter,
                     t,
                     priority_fee_lamports,
+                    lookup_tables,
                 )
                 .await
             }
@@ -151,6 +195,10 @@ impl TradingClient {
     }
 }
 
+fn allows_jupiter_fallback(venue: Option<Venue>) -> bool {
+    matches!(venue, Some(Venue::PumpFun))
+}
+
 fn venue_err(venue: &'static str, r: anyhow::Result<Quote>) -> Result<Quote> {
     r.map_err(|e| dex_err(venue, e))
 }
@@ -167,6 +215,12 @@ mod tests {
                 .strip_prefix("JUPITER_API_KEY=")
                 .map(|v| v.trim().trim_matches('"').to_string())
         })
+    }
+
+    #[test]
+    fn pumpswap_never_falls_back_to_jupiter() {
+        assert!(!allows_jupiter_fallback(Some(Venue::PumpSwap)));
+        assert!(allows_jupiter_fallback(Some(Venue::PumpFun)));
     }
 
     #[tokio::test]

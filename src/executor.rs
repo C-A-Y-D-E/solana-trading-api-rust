@@ -17,6 +17,7 @@ use crate::types::{Dex, Side, Signer, Submitter, SwapResult, SwapStatus, Trade};
 const CU_LIMIT_MAX: u32 = 1_400_000;
 
 const DEFAULT_CU_LIMIT: u32 = 350_000;
+const MAX_TRANSACTION_BYTES: u64 = 1_232;
 
 pub(crate) fn dex_err(venue: &'static str, e: anyhow::Error) -> TradeError {
     match e.downcast::<TradeError>() {
@@ -35,8 +36,14 @@ pub(crate) async fn submit_swap(
     submitter: &dyn Submitter,
     params: &Trade,
     priority_fee_lamports: u64,
+    supplemental_lookup_tables: &[AddressLookupTableAccount],
 ) -> Result<SwapResult> {
-    let (instructions, alts) = dex.swap(params).await.map_err(|e| dex_err(dex.name(), e))?;
+    let (instructions, mut alts) = dex.swap(params).await.map_err(|e| dex_err(dex.name(), e))?;
+    for lookup_table in supplemental_lookup_tables {
+        if !alts.iter().any(|existing| existing.key == lookup_table.key) {
+            alts.push(lookup_table.clone());
+        }
+    }
     let mut tx = build_optimal_tx(
         rpc,
         &params.wallet,
@@ -96,10 +103,18 @@ pub(crate) async fn build_optimal_tx(
         })?;
     let msg = v0::Message::try_compile(payer, &all, lookup_tables, blockhash)
         .map_err(|e| TradeError::Build(format!("compile message: {e:?}")))?;
-    Ok(VersionedTransaction {
+    let tx = VersionedTransaction {
         signatures: vec![Signature::default()],
         message: VersionedMessage::V0(msg),
-    })
+    };
+    let serialized_size = bincode::serialized_size(&tx)
+        .map_err(|e| TradeError::Build(format!("measure transaction: {e}")))?;
+    if serialized_size > MAX_TRANSACTION_BYTES {
+        return Err(TradeError::Build(format!(
+            "transaction is {serialized_size} bytes; maximum is {MAX_TRANSACTION_BYTES}; provide an address lookup table"
+        )));
+    }
+    Ok(tx)
 }
 
 async fn simulate_units(

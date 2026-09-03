@@ -63,12 +63,12 @@ Core types (`types.rs`):
 
 ```rust
 pub enum Side { Buy, Sell }
-pub enum Venue { PumpFun, PumpSwap }   // Jupiter is the universal fallback, not selectable
+pub enum Venue { PumpFun, PumpSwap }   // None routes directly to Jupiter
 
 pub struct Trade {            // the request — only what the caller knows
     pub wallet: Pubkey, pub mint: Pubkey, pub side: Side,
-    pub amount: u64,          // Buy: quote-in (fee incl). Sell: base tokens.
-    pub slippage_bps: u64, pub venue: Option<Venue>, // None → Jupiter fallback
+    pub amount: u64,          // Buy: SOL lamports. Sell: base tokens.
+    pub slippage_bps: u64, pub venue: Option<Venue>, // None → Jupiter
     pub pool: Option<Pubkey>, // None → venue derives canonical pool from the mint
 }                             // Trade::buy(..) / Trade::sell(..) / .with_pool(..)
 
@@ -76,9 +76,11 @@ pub struct Quote { in_amount, expected_out, min_out, fee }   // pure numbers
 ```
 
 Each venue implements the `Dex` trait (`quote`/`swap(&Trade)`), deriving its own pool
-when `trade.pool` is `None`. Jupiter isn't a `Dex` (HTTP aggregator) — the client
-handles it. Everything venue-specific stays inside each module — `Trade`/`Quote`
-never carry addresses or per-venue flags, so adding a DEX never churns the shared types.
+when `trade.pool` is `None`. PumpSwap reads that pool's quote mint and automatically
+routes USDC-quoted buys through its SOL/USDC pool. Jupiter is an HTTP aggregator handled
+by the client; Pump.fun may fall back to it before submission, while PumpSwap never does.
+Everything venue-specific stays inside each module — `Trade`/`Quote` never carry
+per-venue routing flags, so adding a DEX never churns the shared types.
 
 ---
 

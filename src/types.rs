@@ -34,6 +34,10 @@ pub struct Trade {
 }
 
 impl Trade {
+    /// Builds a SOL-funded buy.
+    ///
+    /// PumpSwap automatically bridges through USDC when the target pool is
+    /// quoted in USDC, so `amount` remains SOL lamports for every buy venue.
     pub fn buy(
         wallet: Pubkey,
         mint: Pubkey,
