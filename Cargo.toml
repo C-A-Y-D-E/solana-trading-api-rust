@@ -24,6 +24,7 @@ solana-message = "3.1.0"
 solana-transaction = { version = "3.1.0", features = ["bincode"] }
 solana-signature = "3.3.0"
 solana-commitment-config = "3.1.0"
+solana-address-lookup-table-interface = { version = "3.0.1", features = ["bincode", "bytemuck"] }
 # sha256 for deriving Anchor instruction discriminators from method names
 sha2 = "0.10"
 spl-token = "9.0.0"
@@ -36,3 +37,4 @@ tokio = "1.52.3"
 # is the real signer; this is only to exercise the executor end-to-end)
 solana-keypair = "3.0.0"
 solana-signer = "3.0.0"
+solana-slot-hashes = { version = "3.0.1", features = ["serde"] }

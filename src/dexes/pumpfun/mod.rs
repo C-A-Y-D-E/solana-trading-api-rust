@@ -106,6 +106,26 @@ impl PumpFun {
         pda(&[b"bonding-curve", mint.as_ref()], &PROGRAM_ID)
     }
 
+    /// Shared accounts for any token and trading wallet, using current fee recipients.
+    pub async fn shared_lookup_addresses(&self) -> Result<Vec<Pubkey>> {
+        let account = self.rpc.get_account(&Self::global_pda()).await?;
+        let global: GlobalAccount = decode_account(&account.data)?;
+        let mut addresses = vec![
+            PROGRAM_ID,
+            FEE_PROGRAM_ID,
+            Self::global_pda(),
+            Self::event_authority_pda(),
+            Self::global_volume_pda(),
+            Self::fee_config_pda(),
+            global.fee_recipient,
+            global.reserved_fee_recipient,
+        ];
+        addresses.extend(global.fee_recipients);
+        addresses.extend(global.reserved_fee_recipients);
+        addresses.extend(global.buyback_fee_recipients);
+        Ok(addresses)
+    }
+
     fn global_pda() -> Pubkey {
         pda(&[b"global"], &PROGRAM_ID)
     }

@@ -106,6 +106,65 @@ shared PumpSwap accounts and pool accounts; oversized transactions return a
 build error before signing. The default bridge pool is `DEFAULT_SOL_USDC_POOL`
 and can be replaced with `TradingClient::with_pumpswap_sol_usdc_pool`.
 
+Create one shared Pump.fun/PumpSwap lookup table with the included example. Put the
+authority's base58 keypair in the ignored `.env` file, optionally with a private
+RPC endpoint:
+
+```dotenv
+PRIVATE_KEY="base58-keypair"
+RPC_URL="https://your-mainnet-rpc"
+```
+
+Preview the shared addresses without loading the key or sending a transaction:
+
+```bash
+cargo run --release --example create_shared_alt -- --dry-run
+```
+
+Create the table once:
+
+```bash
+cargo run --release --example create_shared_alt
+```
+
+This sends one create transaction plus one or more extend transactions and pays
+their rent and fees from that keypair. It reads current fee recipients from both
+venues and includes global/config/event/volume accounts, common programs, WSOL/USDC
+mints and fee ATAs, the default bloXroute tip recipient, and the fixed SOL/USDC bridge
+accounts. Set `PUMPSWAP_SOL_USDC_POOL` only if using a different bridge in the client.
+
+No target mint, target pool, or trading wallet is required. Those varying accounts
+remain inline in each transaction. The keypair controls and funds the table; all
+trading wallets can use it. Invoked program IDs and signers remain inline even when
+listed in the table. The executor still checks each transaction's final byte size.
+
+The script waits for activation and prints `ALT_ADDRESS=...`. To resume an interrupted
+creation or append newly configured fee recipients/bridge accounts to the same table:
+
+```bash
+cargo run --release --example create_shared_alt -- --table YOUR_ALT_ADDRESS
+```
+
+It checks authority and table capacity and only appends missing addresses. No table
+update is needed when trading a different target token. The creation/extension flow
+uses Solana's [address lookup table instructions](https://solana.com/developers/cookbook/transactions/lookup-tables).
+
+Before creating a table, the script checks payer funding for the full list's additional
+rent and estimated transaction fees. Creation selects a slot from the `SlotHashes`
+sysvar. If an extension fails, fund the payer if necessary and resume with the table
+address already printed; rerunning without `--table` may create another table.
+
+Load the printed address and pass it to the swap:
+
+```rust
+use solana_trading_api::load_address_lookup_table;
+
+let shared_alt = load_address_lookup_table(rpc.as_ref(), alt_address).await?;
+let result = client
+    .swap_with_lookup_tables(&trade, &signer, &blox, 50_000, &[shared_alt])
+    .await?;
+```
+
 ### Submit-now: return the hash before it confirms
 
 `swap` blocks until the tx confirms (or the deadline). For a low-latency response —

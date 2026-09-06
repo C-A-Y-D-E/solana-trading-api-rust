@@ -41,6 +41,26 @@ struct PoolAccount {
     is_cashback_coin: bool,
 }
 
+fn decode_pool(data: &[u8]) -> Result<(PoolAccount, i128)> {
+    let mut remaining = data;
+    let pool = PoolAccount::deserialize_reader(&mut remaining)?;
+    // Older accounts predate the appended virtual quote reserve field.
+    let virtual_quote_reserves = if remaining.is_empty() {
+        0
+    } else {
+        i128::deserialize_reader(&mut remaining)?
+    };
+    Ok((pool, virtual_quote_reserves))
+}
+
+fn effective_quote_reserves(vault_balance: u64, virtual_reserves: i128) -> Result<u64> {
+    let reserves = i128::from(vault_balance)
+        .checked_add(virtual_reserves)
+        .ok_or_else(|| anyhow!("pumpswap: effective quote reserves overflow"))?;
+    u64::try_from(reserves)
+        .map_err(|_| anyhow!("pumpswap: effective quote reserves outside u64 range"))
+}
+
 #[derive(BorshDeserialize)]
 #[allow(dead_code)]
 struct GlobalConfigAccount {
@@ -126,6 +146,48 @@ impl PumpSwap {
         self
     }
 
+    /// Shared venue accounts plus the fixed SOL/USDC bridge, without target or user accounts.
+    pub async fn shared_lookup_addresses(&self) -> Result<Vec<Pubkey>> {
+        let account = self.rpc.get_account(&Self::global_config_pda()).await?;
+        let global: GlobalConfigAccount = decode_account(&account.data)?;
+        let mut addresses = vec![
+            PROGRAM_ID,
+            FEE_PROGRAM_ID,
+            Self::global_config_pda(),
+            Self::event_authority_pda(),
+            Self::global_volume_pda(),
+            Self::fee_config_pda(),
+        ];
+        let recipients = global
+            .protocol_fee_recipients
+            .into_iter()
+            .chain([global.reserved_fee_recipient])
+            .chain(global.reserved_fee_recipients)
+            .chain(global.buyback_fee_recipients);
+        for recipient in recipients.filter(|key| *key != Pubkey::default()) {
+            addresses.push(recipient);
+            addresses.push(ata(&recipient, &WSOL, &TOKEN_PROGRAM));
+            addresses.push(ata(&recipient, &USDC_MINT, &TOKEN_PROGRAM));
+        }
+        addresses.extend(self.bridge_lookup_addresses().await?);
+        Ok(addresses)
+    }
+
+    async fn bridge_lookup_addresses(&self) -> Result<Vec<Pubkey>> {
+        let pool = self.load_sol_usdc_pool().await?;
+        let creator_vault = Self::coin_creator_vault_authority_pda(&pool.coin_creator);
+        Ok(vec![
+            self.sol_usdc_pool,
+            pool.base_mint,
+            pool.quote_mint,
+            pool.base_vault,
+            pool.quote_vault,
+            creator_vault,
+            ata(&creator_vault, &pool.quote_mint, &pool.quote_token_program),
+            Self::pool_v2_pda(&pool.base_mint),
+        ])
+    }
+
     pub fn canonical_pool_pda(mint: &Pubkey) -> Pubkey {
         let pool_authority = pda(&[b"pool-authority", mint.as_ref()], &PUMPFUN_PROGRAM_ID);
         pda(
@@ -182,7 +244,7 @@ impl PumpSwap {
 
     async fn load_pool(&self, pool_address: &Pubkey, mint: &Pubkey) -> Result<PoolState> {
         let acc = self.rpc.get_account(pool_address).await?;
-        let pool: PoolAccount = decode_account(&acc.data)
+        let (pool, virtual_quote_reserves) = decode_pool(&acc.data)
             .map_err(|e| anyhow!("pumpswap: bad pool {pool_address}: {e}"))?;
         if pool.base_mint != *mint {
             return Err(anyhow!(
@@ -216,7 +278,10 @@ impl PumpSwap {
             base_vault: pool.pool_base_token_account,
             quote_vault: pool.pool_quote_token_account,
             base_reserves: base_balance.amount.parse()?,
-            quote_reserves: quote_balance.amount.parse()?,
+            quote_reserves: effective_quote_reserves(
+                quote_balance.amount.parse()?,
+                virtual_quote_reserves,
+            )?,
             is_mayhem: pool.is_mayhem_mode,
             is_cashback: pool.is_cashback_coin,
             base_token_program,
@@ -631,6 +696,24 @@ mod tests {
     use super::*;
     use crate::types::Venue;
 
+    #[test]
+    fn decodes_legacy_and_virtual_reserve_pool_layouts() {
+        let mut data = vec![0; 245];
+        assert_eq!(decode_pool(&data).unwrap().1, 0);
+        data.extend_from_slice(&500_000_i128.to_le_bytes());
+        assert_eq!(decode_pool(&data).unwrap().1, 500_000);
+        assert!(decode_pool(&data[..250]).is_err());
+    }
+
+    #[test]
+    fn effective_reserves_include_signed_virtual_liquidity() {
+        assert_eq!(effective_quote_reserves(100, 900).unwrap(), 1_000);
+        assert_eq!(effective_quote_reserves(100, -50).unwrap(), 50);
+        assert!(effective_quote_reserves(100, -101).is_err());
+        assert!(effective_quote_reserves(u64::MAX, 1).is_err());
+        assert!(effective_quote_reserves(1, i128::MAX).is_err());
+    }
+
     fn test_fees() -> FeeSettings {
         FeeSettings {
             standard_protocol_recipient: Pubkey::new_unique(),
@@ -762,7 +845,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "live mainnet RPC"]
-    async fn quote_buy_from_usdc_pool() {
+    async fn simulate_buy_from_usdc_pool() {
         let rpc = Arc::new(RpcClient::new(
             "https://api.mainnet-beta.solana.com".to_string(),
         ));
@@ -798,34 +881,45 @@ mod tests {
         );
         assert_eq!(&swaps[0].data[8..16], &swaps[1].data[8..16]);
 
+        let mut execution_instructions = vec![
+            set_compute_unit_limit(350_000),
+            set_compute_unit_price(50_000),
+        ];
+        execution_instructions.extend(instructions.clone());
+        execution_instructions.push(tip(
+            &wallet,
+            &crate::submit::BloxrouteSubmitter::DEFAULT_TIP_ACCOUNT,
+            crate::submit::BloxrouteSubmitter::MIN_TIP_LAMPORTS,
+        ));
         let blockhash = dex.rpc.get_latest_blockhash().await.unwrap();
-        let message =
-            solana_message::v0::Message::try_compile(&wallet, &instructions, &[], blockhash)
-                .unwrap();
+        let message = solana_message::v0::Message::try_compile(
+            &wallet,
+            &execution_instructions,
+            &[],
+            blockhash,
+        )
+        .unwrap();
         let transaction = solana_transaction::versioned::VersionedTransaction {
             signatures: vec![solana_signature::Signature::default()],
             message: solana_message::VersionedMessage::V0(message),
         };
         assert!(bincode::serialized_size(&transaction).unwrap() > 1_232);
 
-        let mut lookup_addresses = Vec::new();
-        for account in instructions
-            .iter()
-            .flat_map(|instruction| &instruction.accounts)
-            .filter(|account| !account.is_signer)
-        {
-            if !lookup_addresses.contains(&account.pubkey) {
-                lookup_addresses.push(account.pubkey);
-            }
-        }
+        let lookup_addresses =
+            crate::shared_lookup_addresses(dex.rpc.clone(), DEFAULT_SOL_USDC_POOL)
+                .await
+                .unwrap();
+        assert!(!lookup_addresses.contains(&pool));
+        assert!(!lookup_addresses.contains(&mint));
+        assert!(!lookup_addresses.contains(&wallet));
         let lookup_table = AddressLookupTableAccount {
             key: Pubkey::new_unique(),
             addresses: lookup_addresses,
         };
         let compressed_message = solana_message::v0::Message::try_compile(
             &wallet,
-            &instructions,
-            &[lookup_table],
+            &execution_instructions,
+            std::slice::from_ref(&lookup_table),
             blockhash,
         )
         .unwrap();
@@ -834,6 +928,84 @@ mod tests {
             message: solana_message::VersionedMessage::V0(compressed_message),
         };
         assert!(bincode::serialized_size(&compressed_transaction).unwrap() <= 1_232);
+        println!(
+            "shared ALT transaction size: {} ({} reusable addresses)",
+            bincode::serialized_size(&compressed_transaction).unwrap(),
+            lookup_table.addresses.len()
+        );
+        let other_wallet = Pubkey::new_unique();
+        let mut other_instructions = execution_instructions.clone();
+        // Replace every wallet-derived address to prove the table is not tied to one user.
+        let mut other_trade = trade;
+        other_trade.wallet = other_wallet;
+        other_instructions.splice(
+            2..2 + instructions.len(),
+            dex.swap(&other_trade).await.unwrap().0,
+        );
+        *other_instructions.last_mut().unwrap() = tip(
+            &other_wallet,
+            &crate::BloxrouteSubmitter::DEFAULT_TIP_ACCOUNT,
+            crate::BloxrouteSubmitter::MIN_TIP_LAMPORTS,
+        );
+        let other_message = solana_message::v0::Message::try_compile(
+            &other_wallet,
+            &other_instructions,
+            &[lookup_table],
+            blockhash,
+        )
+        .unwrap();
+        let other_transaction = solana_transaction::versioned::VersionedTransaction {
+            signatures: vec![solana_signature::Signature::default()],
+            message: solana_message::VersionedMessage::V0(other_message),
+        };
+        assert!(bincode::serialized_size(&other_transaction).unwrap() <= 1_232);
+
+        // Public tables are test fixtures only; their owners can deactivate them.
+        let mut public_lookup_tables = Vec::new();
+        for address in [
+            "9wfFYYUnyXubYcLt1MWNVzS4KXZ2zsojuzAd3bSTU6Jo",
+            "6Nv8PjtF6xymKEBFNhjkSDw1Gbsd9MChE1VmWZsrw6qd",
+        ] {
+            public_lookup_tables.push(
+                crate::load_address_lookup_table(dex.rpc.as_ref(), address.parse().unwrap())
+                    .await
+                    .unwrap(),
+            );
+        }
+        let public_message = solana_message::v0::Message::try_compile(
+            &wallet,
+            &execution_instructions,
+            &public_lookup_tables,
+            blockhash,
+        )
+        .unwrap();
+        let public_transaction = solana_transaction::versioned::VersionedTransaction {
+            signatures: vec![solana_signature::Signature::default()],
+            message: solana_message::VersionedMessage::V0(public_message),
+        };
+        println!(
+            "public ALT transaction size: {}",
+            bincode::serialized_size(&public_transaction).unwrap()
+        );
+        assert!(bincode::serialized_size(&public_transaction).unwrap() <= 1_232);
+        let simulation = dex
+            .rpc
+            .simulate_transaction_with_config(
+                &public_transaction,
+                solana_client::rpc_config::RpcSimulateTransactionConfig {
+                    sig_verify: false,
+                    replace_recent_blockhash: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .value;
+        for log in simulation.logs.unwrap_or_default() {
+            println!("{log}");
+        }
+        println!("simulation compute units: {:?}", simulation.units_consumed);
+        assert_eq!(simulation.err, None);
     }
 
     #[tokio::test]

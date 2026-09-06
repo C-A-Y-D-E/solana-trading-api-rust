@@ -3,6 +3,7 @@ pub mod dexes;
 pub mod error;
 pub mod executor;
 pub mod jupiter;
+pub mod lookup_table;
 pub mod submit;
 pub mod types;
 
@@ -11,6 +12,7 @@ pub use dexes::pumpfun::PumpFun;
 pub use dexes::pumpswap::{DEFAULT_SOL_USDC_POOL, PumpSwap, USDC_MINT};
 pub use error::{Result, TradeError};
 pub use jupiter::Jupiter;
+pub use lookup_table::{load_address_lookup_table, shared_lookup_addresses};
 pub use submit::{BloxrouteSubmitter, RpcSubmitter, SubmitProtection};
 pub use types::{Dex, Quote, Side, Signer, Submitter, SwapResult, SwapStatus, Tip, Trade, Venue};
 
