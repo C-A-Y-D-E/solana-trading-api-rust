@@ -56,6 +56,8 @@ impl Trade {
         }
     }
 
+    /// Sells base-token units for SOL. PumpSwap USDC pairs bridge the guaranteed
+    /// USDC proceeds to SOL atomically; surplus USDC stays in the wallet.
     pub fn sell(
         wallet: Pubkey,
         mint: Pubkey,

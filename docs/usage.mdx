@@ -65,7 +65,7 @@ That's it. Notes:
 - `amount` is **SOL lamports** for a buy and **base tokens** for a sell. PumpSwap
   automatically bridges through USDC when the selected pool is USDC-quoted.
 - The **pool is derived** from the mint per venue. Override for a non-canonical / USDC
-  PumpSwap pool with `Trade::buy(...).with_pool(pool)`.
+  PumpSwap pool with `Trade::buy(...).with_pool(pool)` or `Trade::sell(...).with_pool(pool)`.
 - On a **Pump.fun pre-send failure** (e.g. the token graduated), the client
   **falls back to Jupiter** automatically. PumpSwap never uses Jupiter. The fallback is
   **pre-send only** — once the tx is broadcast, a confirmation hiccup is never retried,
@@ -99,6 +99,33 @@ The pool's on-chain `quote_mint` selects this route automatically. `amount` is
 the maximum SOL spend in lamports. It atomically buys
 an exact amount of USDC from the configured PumpSwap USDC/WSOL pool, then spends
 all of that USDC in the target pool. This route never falls back to Jupiter.
+
+For a sell, use the same API and lookup tables:
+
+```rust
+let trade = Trade::sell(wallet, mint, token_amount, 500, Some(Venue::PumpSwap))
+    .with_pool(usdc_target_pool);
+```
+
+This atomically sells tokens for USDC, spends the first leg's guaranteed minimum
+USDC on the bridge, and unwraps the resulting WSOL into native SOL. The user does
+not need an existing USDC balance, but still needs SOL for fees and account rent.
+Any USDC received above that minimum remains in the wallet; the bridge does not
+spend pre-existing USDC. Sell quotes return `expected_out` and `min_out` in SOL
+lamports based on the fixed bridge input. For both routed buys and sells, `fee`
+reports only the bridge fee in lamports, not the combined fees of both legs.
+Slippage is split between the legs, with at most 50 bps allocated to the bridge.
+
+Run the read-only mainnet sell simulation (no private key or broadcast):
+
+```sh
+cargo test --lib simulate_sell_from_usdc_pool -- --ignored --nocapture
+```
+
+The test uses the shared `DG8Y7fV6NaiFBu1LfjNquqbqcPFAVvFA8uP1DhCVC5vb` table,
+checks sell-only transaction size, then simulates a buy followed by the two-hop sell
+to seed the fixture wallet with tokens. It verifies that WSOL is unwrapped and
+pre-existing USDC is preserved. Live pool state and table availability can change.
 
 The two PumpSwap instructions exceed Solana's packet size without address
 compression. Pass one or more on-chain address lookup tables containing the
@@ -307,8 +334,10 @@ If your backend is on `anyhow`, `?` still works — `TradeError` implements
 - **Token-2022 handled** — the right token program is detected per mint.
 - **Jupiter needs an API key** (`api.jup.ag`) for the `/swap/v2/build` endpoint;
   `lite-api.jup.ag` (free) is v1-only.
-- **No cross-quote routing in our own venues** — a USDC-quoted pool needs the user to
-  hold USDC; for "pay SOL for anything", pass `venue: None` (Jupiter routes SOL→token).
-- **Flat fees** (global bps), not tiered — fine for normal sizes.
+- **PumpSwap cross-quote routing** — USDC pairs use the configured USDC/WSOL bridge
+  for SOL-funded buys and SOL-output sells. Other quote mints are rejected.
+  Pump.fun USDC-quoted curves are not covered by this PumpSwap route.
+- **Flat fee estimates** (global bps), not tiered — quotes can differ from the
+  program's dynamic fees; on-chain minimum-output checks still protect execution.
 - **Confirmation is synchronous-with-deadline**: only `hash` is known at send time;
   `status` + `amount_received` come from the landed tx.

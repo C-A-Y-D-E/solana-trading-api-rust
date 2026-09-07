@@ -11,6 +11,9 @@ use solana_pubkey::{Pubkey, pubkey};
 use crate::dexes::common::*;
 use crate::types::{Dex, Quote, Side, Trade};
 
+#[cfg(test)]
+mod sell_simulation;
+
 pub const PROGRAM_ID: Pubkey = pubkey!("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA");
 pub const FEE_PROGRAM_ID: Pubkey = pubkey!("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ");
 pub const USDC_MINT: Pubkey = pubkey!("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
@@ -121,7 +124,7 @@ enum BuyAmounts {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum BuyRoute {
+enum SwapRoute {
     DirectSol,
     ViaUsdc,
 }
@@ -515,6 +518,38 @@ impl PumpSwap {
         instructions
     }
 
+    fn sell_instructions(
+        &self,
+        trade: &Trade,
+        pool_address: Pubkey,
+        pool: &PoolState,
+        fees: FeeSettings,
+        min_quote_out: u64,
+    ) -> Vec<Instruction> {
+        let mut data = Vec::with_capacity(24);
+        data.extend_from_slice(&anchor_discriminator(SELL_IX));
+        data.extend_from_slice(&trade.amount.to_le_bytes());
+        data.extend_from_slice(&min_quote_out.to_le_bytes());
+        let mut instructions = vec![
+            create_ata_idempotent(
+                &trade.wallet,
+                &trade.wallet,
+                &pool.quote_mint,
+                &pool.quote_token_program,
+            ),
+            Instruction {
+                program_id: PROGRAM_ID,
+                accounts: self.swap_accounts(trade, pool_address, pool, fees),
+                data,
+            },
+        ];
+        if pool.quote_mint == WSOL {
+            let quote_ata = ata(&trade.wallet, &WSOL, &pool.quote_token_program);
+            instructions.push(close_account(&quote_ata, &trade.wallet, &trade.wallet));
+        }
+        instructions
+    }
+
     fn route_slippage(total_bps: u64) -> (u64, u64) {
         let bridge_bps = (total_bps / 2).min(MAX_BRIDGE_SLIPPAGE_BPS);
         (bridge_bps, total_bps - bridge_bps)
@@ -531,13 +566,11 @@ impl PumpSwap {
         Ok(bridge_pool)
     }
 
-    fn buy_route(pool: &PoolState) -> Result<BuyRoute> {
+    fn swap_route(pool: &PoolState) -> Result<SwapRoute> {
         match pool.quote_mint {
-            WSOL => Ok(BuyRoute::DirectSol),
-            USDC_MINT => Ok(BuyRoute::ViaUsdc),
-            quote_mint => Err(anyhow!(
-                "pumpswap buy does not support quote mint {quote_mint}"
-            )),
+            WSOL => Ok(SwapRoute::DirectSol),
+            USDC_MINT => Ok(SwapRoute::ViaUsdc),
+            quote_mint => Err(anyhow!("pumpswap does not support quote mint {quote_mint}")),
         }
     }
 
@@ -549,6 +582,19 @@ impl PumpSwap {
         fees: &FeeSettings,
     ) -> (Quote, Quote) {
         let (bridge_slippage, target_slippage) = Self::route_slippage(p.slippage_bps);
+        if p.side == Side::Sell {
+            let target_quote =
+                self.compute_quote(target_pool, fees, Side::Sell, p.amount, target_slippage);
+            // Only spend guaranteed proceeds; favorable execution leaves surplus USDC in the wallet.
+            let bridge_quote = self.compute_quote(
+                bridge_pool,
+                fees,
+                Side::Sell,
+                target_quote.min_out,
+                bridge_slippage,
+            );
+            return (bridge_quote, target_quote);
+        }
         let bridge_quote =
             self.compute_quote(bridge_pool, fees, Side::Buy, p.amount, bridge_slippage);
         let target_quote = self.compute_quote(
@@ -569,12 +615,50 @@ impl PumpSwap {
     ) -> Result<Quote> {
         let bridge_pool = self.load_sol_usdc_pool().await?;
         let (bridge_quote, target_quote) = self.route_quotes(p, &bridge_pool, target_pool, fees);
+        let output_quote = match p.side {
+            Side::Buy => target_quote,
+            Side::Sell => bridge_quote,
+        };
         Ok(Quote {
             in_amount: p.amount,
-            expected_out: target_quote.expected_out,
-            min_out: target_quote.min_out,
+            expected_out: output_quote.expected_out,
+            min_out: output_quote.min_out,
             fee: bridge_quote.fee,
         })
+    }
+
+    fn sell_via_usdc_instructions(
+        &self,
+        trade: &Trade,
+        target_pool_address: Pubkey,
+        target_pool: &PoolState,
+        bridge_pool: &PoolState,
+        fees: FeeSettings,
+    ) -> Result<Vec<Instruction>> {
+        let (bridge_quote, target_quote) =
+            self.route_quotes(trade, bridge_pool, target_pool, &fees);
+        if target_quote.min_out == 0 || bridge_quote.min_out == 0 {
+            return Err(anyhow!("pumpswap USDC route output is zero"));
+        }
+        let mut instructions = self.sell_instructions(
+            trade,
+            target_pool_address,
+            target_pool,
+            fees,
+            target_quote.min_out,
+        );
+        let mut bridge_trade = *trade;
+        bridge_trade.mint = USDC_MINT;
+        bridge_trade.pool = Some(self.sol_usdc_pool);
+        bridge_trade.amount = target_quote.min_out;
+        instructions.extend(self.sell_instructions(
+            &bridge_trade,
+            self.sol_usdc_pool,
+            bridge_pool,
+            fees,
+            bridge_quote.min_out,
+        ));
+        Ok(instructions)
     }
 
     async fn swap_via_usdc(
@@ -585,6 +669,18 @@ impl PumpSwap {
         fees: FeeSettings,
     ) -> Result<(Vec<Instruction>, Vec<AddressLookupTableAccount>)> {
         let bridge_pool = self.load_sol_usdc_pool().await?;
+        if p.side == Side::Sell {
+            return Ok((
+                self.sell_via_usdc_instructions(
+                    p,
+                    target_pool_address,
+                    target_pool,
+                    &bridge_pool,
+                    fees,
+                )?,
+                vec![],
+            ));
+        }
         let (bridge_quote, target_quote) = self.route_quotes(p, &bridge_pool, target_pool, &fees);
         if bridge_quote.min_out == 0 || target_quote.min_out == 0 {
             return Err(anyhow!("pumpswap USDC route output is zero"));
@@ -633,7 +729,7 @@ impl Dex for PumpSwap {
             self.load_pool(&pool_address, &p.mint).await?,
             self.fee_settings().await?,
         );
-        if p.side == Side::Buy && Self::buy_route(&pool)? == BuyRoute::ViaUsdc {
+        if Self::swap_route(&pool)? == SwapRoute::ViaUsdc {
             return self.quote_via_usdc(p, &pool, &fees).await;
         }
         Ok(self.compute_quote(&pool, &fees, p.side, p.amount, p.slippage_bps))
@@ -645,11 +741,10 @@ impl Dex for PumpSwap {
             self.load_pool(&pool_address, &p.mint).await?,
             self.fee_settings().await?,
         );
-        if p.side == Side::Buy && Self::buy_route(&pool)? == BuyRoute::ViaUsdc {
+        if Self::swap_route(&pool)? == SwapRoute::ViaUsdc {
             return self.swap_via_usdc(p, pool_address, &pool, fees).await;
         }
         let quote = self.compute_quote(&pool, &fees, p.side, p.amount, p.slippage_bps);
-        let user_quote_ata = ata(&p.wallet, &pool.quote_mint, &pool.quote_token_program);
         let instructions = match p.side {
             Side::Buy => self.buy_instructions(
                 p,
@@ -661,31 +756,7 @@ impl Dex for PumpSwap {
                     min_base_out: quote.min_out,
                 },
             ),
-            Side::Sell => {
-                let mut data = Vec::with_capacity(24);
-                data.extend_from_slice(&anchor_discriminator(SELL_IX));
-                data.extend_from_slice(&p.amount.to_le_bytes());
-                data.extend_from_slice(&quote.min_out.to_le_bytes());
-                let swap_ix = Instruction {
-                    program_id: PROGRAM_ID,
-                    accounts: self.swap_accounts(p, pool_address, &pool, fees),
-                    data,
-                };
-
-                let mut instructions = vec![
-                    create_ata_idempotent(
-                        &p.wallet,
-                        &p.wallet,
-                        &pool.quote_mint,
-                        &pool.quote_token_program,
-                    ),
-                    swap_ix,
-                ];
-                if pool.quote_mint == WSOL {
-                    instructions.push(close_account(&user_quote_ata, &p.wallet, &p.wallet));
-                }
-                instructions
-            }
+            Side::Sell => self.sell_instructions(p, pool_address, &pool, fees, quote.min_out),
         };
         Ok((instructions, vec![]))
     }
@@ -763,18 +834,18 @@ mod tests {
     }
 
     #[test]
-    fn selects_buy_route_from_the_target_pool_quote_mint() {
+    fn selects_swap_route_from_the_target_pool_quote_mint() {
         let mint = Pubkey::new_unique();
 
         assert_eq!(
-            PumpSwap::buy_route(&test_pool(mint, WSOL)).unwrap(),
-            BuyRoute::DirectSol
+            PumpSwap::swap_route(&test_pool(mint, WSOL)).unwrap(),
+            SwapRoute::DirectSol
         );
         assert_eq!(
-            PumpSwap::buy_route(&test_pool(mint, USDC_MINT)).unwrap(),
-            BuyRoute::ViaUsdc
+            PumpSwap::swap_route(&test_pool(mint, USDC_MINT)).unwrap(),
+            SwapRoute::ViaUsdc
         );
-        assert!(PumpSwap::buy_route(&test_pool(mint, Pubkey::new_unique())).is_err());
+        assert!(PumpSwap::swap_route(&test_pool(mint, Pubkey::new_unique())).is_err());
     }
 
     #[test]
@@ -840,6 +911,123 @@ mod tests {
         assert_eq!(
             u64::from_le_bytes(swap.data[8..16].try_into().unwrap()),
             bridge_quote.min_out
+        );
+    }
+
+    #[test]
+    fn selling_usdc_on_the_bridge_unwraps_sol_to_the_wallet() {
+        let wallet = Pubkey::new_unique();
+        let trade = Trade::sell(wallet, USDC_MINT, 100_000, 500, Some(Venue::PumpSwap));
+        let pool = test_pool(USDC_MINT, WSOL);
+        let dex = PumpSwap::new(Arc::new(RpcClient::new(String::new())));
+        let instructions =
+            dex.sell_instructions(&trade, DEFAULT_SOL_USDC_POOL, &pool, test_fees(), 900_000);
+        assert_eq!(instructions.len(), 3);
+        assert_eq!(&instructions[1].data[..8], &anchor_discriminator(SELL_IX));
+        assert_eq!(
+            u64::from_le_bytes(instructions[1].data[8..16].try_into().unwrap()),
+            100_000
+        );
+        assert_eq!(
+            u64::from_le_bytes(instructions[1].data[16..24].try_into().unwrap()),
+            900_000
+        );
+        assert_eq!(
+            instructions[2],
+            close_account(&ata(&wallet, &WSOL, &TOKEN_PROGRAM), &wallet, &wallet)
+        );
+    }
+
+    #[test]
+    fn sell_route_spends_only_guaranteed_usdc_and_unwraps_sol_last() {
+        let wallet = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let target_address = Pubkey::new_unique();
+        let trade = Trade::sell(wallet, mint, 1_000_000, 500, Some(Venue::PumpSwap));
+        let target = test_pool(mint, USDC_MINT);
+        let bridge = test_pool(USDC_MINT, WSOL);
+        let fees = test_fees();
+        let dex = PumpSwap::new(Arc::new(RpcClient::new(String::new())));
+        let (bridge_quote, target_quote) = dex.route_quotes(&trade, &bridge, &target, &fees);
+        let instructions = dex
+            .sell_via_usdc_instructions(&trade, target_address, &target, &bridge, fees)
+            .unwrap();
+
+        assert_eq!(instructions.len(), 5);
+        let target_sell = &instructions[1];
+        let bridge_sell = &instructions[3];
+        assert_eq!(&target_sell.data[..8], &anchor_discriminator(SELL_IX));
+        assert_eq!(&bridge_sell.data[..8], &anchor_discriminator(SELL_IX));
+        assert_eq!(target_sell.accounts[0].pubkey, target_address);
+        assert_eq!(bridge_sell.accounts[0].pubkey, DEFAULT_SOL_USDC_POOL);
+        assert_eq!(&target_sell.data[8..16], &trade.amount.to_le_bytes());
+        assert_eq!(&target_sell.data[16..24], &bridge_sell.data[8..16]);
+        assert_eq!(
+            &bridge_sell.data[16..24],
+            &bridge_quote.min_out.to_le_bytes()
+        );
+        assert_eq!(
+            target_sell.accounts[6].pubkey,
+            bridge_sell.accounts[5].pubkey
+        );
+        assert_eq!(bridge_quote.in_amount, target_quote.min_out);
+        assert!(target_quote.expected_out > bridge_quote.in_amount);
+        assert_eq!(
+            instructions[4],
+            close_account(&ata(&wallet, &WSOL, &TOKEN_PROGRAM), &wallet, &wallet)
+        );
+    }
+
+    #[test]
+    fn sell_route_quotes_the_bridge_in_sol_with_split_slippage() {
+        let mint = Pubkey::new_unique();
+        let trade = Trade::sell(Pubkey::new_unique(), mint, 1_000_000, 500, None);
+        let target = test_pool(mint, USDC_MINT);
+        let bridge = test_pool(USDC_MINT, WSOL);
+        let fees = test_fees();
+        let dex = PumpSwap::new(Arc::new(RpcClient::new(String::new())));
+        let (bridge_quote, target_quote) = dex.route_quotes(&trade, &bridge, &target, &fees);
+        let expected_bridge =
+            dex.compute_quote(&bridge, &fees, Side::Sell, target_quote.min_out, 50);
+
+        assert_eq!(
+            target_quote.min_out,
+            slippage_down(target_quote.expected_out, 450)
+        );
+        assert_eq!(bridge_quote.expected_out, expected_bridge.expected_out);
+        assert_eq!(bridge_quote.min_out, expected_bridge.min_out);
+        assert_eq!(bridge_quote.fee, expected_bridge.fee);
+    }
+
+    #[test]
+    fn sell_route_rejects_zero_output_on_either_leg() {
+        let mint = Pubkey::new_unique();
+        let mut target = test_pool(mint, USDC_MINT);
+        let mut bridge = test_pool(USDC_MINT, WSOL);
+        let dex = PumpSwap::new(Arc::new(RpcClient::new(String::new())));
+        let trade = Trade::sell(Pubkey::new_unique(), mint, 1_000_000, 500, None);
+        bridge.quote_reserves = 0;
+        assert!(
+            dex.sell_via_usdc_instructions(
+                &trade,
+                Pubkey::new_unique(),
+                &target,
+                &bridge,
+                test_fees()
+            )
+            .is_err()
+        );
+        bridge.quote_reserves = 10_000_000_000_000;
+        target.quote_reserves = 0;
+        assert!(
+            dex.sell_via_usdc_instructions(
+                &trade,
+                Pubkey::new_unique(),
+                &target,
+                &bridge,
+                test_fees()
+            )
+            .is_err()
         );
     }
 
