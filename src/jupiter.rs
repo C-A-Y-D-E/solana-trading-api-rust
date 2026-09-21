@@ -10,7 +10,10 @@ use solana_pubkey::Pubkey;
 
 use crate::dexes::common::WSOL;
 use crate::error::{Result, TradeError};
-use crate::types::{Dex, Quote, Side, Trade};
+use crate::types::{Dex, PreparedSwap, Quote, Settlement, Side, Trade};
+
+#[cfg(test)]
+mod tests;
 
 pub struct Jupiter {
     http: reqwest::Client,
@@ -21,6 +24,9 @@ pub struct Jupiter {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BuildResponse {
+    input_mint: String,
+    output_mint: String,
+    swap_mode: String,
     in_amount: String,
     out_amount: String,
     other_amount_threshold: String,
@@ -29,6 +35,42 @@ struct BuildResponse {
     cleanup_instruction: Option<ApiInstruction>,
     other_instructions: Vec<ApiInstruction>,
     addresses_by_lookup_table_address: Option<HashMap<String, Vec<String>>>,
+}
+
+impl BuildResponse {
+    fn validate(&self, trade: &Trade) -> Result<()> {
+        let (input, output) = Jupiter::route_mints(trade);
+        if self.swap_mode != "ExactIn"
+            || self.input_mint != input.to_string()
+            || self.output_mint != output.to_string()
+            || parse_amount("inAmount", &self.in_amount)? != trade.amount
+        {
+            return Err(TradeError::Decode(
+                "jupiter",
+                "build response does not match the requested exact-input trade".into(),
+            ));
+        }
+        let quote = self.quote()?;
+        if quote.min_out == 0 || quote.expected_out < quote.min_out {
+            return Err(TradeError::Decode(
+                "jupiter",
+                "invalid minimum output".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn quote(&self) -> Result<Quote> {
+        Ok(Quote {
+            in_amount: parse_amount("inAmount", &self.in_amount)?,
+            // This adapter has no pool-reserve snapshot for the SDK's curve-only metric.
+            price_impact_bps: None,
+            expected_out: parse_amount("outAmount", &self.out_amount)?,
+            min_out: parse_amount("otherAmountThreshold", &self.other_amount_threshold)?,
+            fee: 0,
+            application_fee: 0,
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -57,9 +99,13 @@ impl Jupiter {
     }
 
     fn route_mints(p: &Trade) -> (Pubkey, Pubkey) {
+        let settlement_mint = match p.settlement {
+            Settlement::Sol => WSOL,
+            Settlement::Usdc => crate::USDC_MINT,
+        };
         match p.side {
-            Side::Buy => (WSOL, p.mint),
-            Side::Sell => (p.mint, WSOL),
+            Side::Buy => (settlement_mint, p.mint),
+            Side::Sell => (p.mint, settlement_mint),
         }
     }
 
@@ -84,6 +130,12 @@ impl Jupiter {
 
     async fn build(&self, p: &Trade) -> Result<BuildResponse> {
         let (input_mint, output_mint) = Self::route_mints(p);
+        if p.amount == 0 || p.slippage_bps >= 10_000 || input_mint == output_mint {
+            return Err(TradeError::Build(
+                "Jupiter requires different mints, positive input and slippage below 10000 bps"
+                    .into(),
+            ));
+        }
         let mut req = self
             .http
             .get(format!("{}/swap/v2/build", self.base_url))
@@ -93,6 +145,7 @@ impl Jupiter {
                 ("amount", p.amount.to_string()),
                 ("taker", p.wallet.to_string()),
                 ("slippageBps", p.slippage_bps.to_string()),
+                ("wrapAndUnwrapSol", "true".into()),
             ]);
         if let Some(key) = &self.api_key {
             req = req.header("x-api-key", key);
@@ -106,9 +159,12 @@ impl Jupiter {
                 body: res.text().await.unwrap_or_default(),
             });
         }
-        res.json::<BuildResponse>()
+        let build = res
+            .json::<BuildResponse>()
             .await
-            .map_err(|e| TradeError::Decode("jupiter", e.to_string()))
+            .map_err(|e| TradeError::Decode("jupiter", e.to_string()))?;
+        build.validate(p)?;
+        Ok(build)
     }
 
     fn swap_instructions(b: &BuildResponse) -> Result<Vec<Instruction>> {
@@ -157,23 +213,19 @@ impl Dex for Jupiter {
     }
 
     async fn quote(&self, p: &Trade) -> anyhow::Result<Quote> {
-        let b = self.build(p).await?;
-        Ok(Quote {
-            in_amount: b.in_amount.parse().unwrap_or(p.amount),
-            expected_out: parse_amount("outAmount", &b.out_amount)?,
-            min_out: parse_amount("otherAmountThreshold", &b.other_amount_threshold)?,
-            fee: 0,
-        })
+        Ok(self.build(p).await?.quote()?)
     }
 
-    async fn swap(
-        &self,
-        p: &Trade,
-    ) -> anyhow::Result<(Vec<Instruction>, Vec<AddressLookupTableAccount>)> {
+    async fn prepare_swap(&self, p: &Trade) -> anyhow::Result<PreparedSwap> {
         let build = self.build(p).await?;
         let instructions = Self::swap_instructions(&build)?;
         let alts = Self::lookup_tables(&build)?;
-        Ok((instructions, alts))
+        Ok(PreparedSwap {
+            venue: self.name(),
+            quote: build.quote()?,
+            instructions,
+            lookup_tables: alts,
+        })
     }
 }
 

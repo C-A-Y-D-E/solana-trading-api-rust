@@ -3,6 +3,7 @@ use crate::types::Venue;
 use solana_client::rpc_config::{
     RpcSimulateTransactionAccountsConfig, RpcSimulateTransactionConfig,
 };
+use solana_message::AddressLookupTableAccount;
 use solana_message::{VersionedMessage, v0};
 use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;

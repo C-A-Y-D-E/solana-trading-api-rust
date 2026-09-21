@@ -4,6 +4,15 @@ version = "0.1.1"
 edition = "2024"
 # never publish to crates.io — this stays private (consumed via private git / path dep)
 publish = false
+autotests = false
+
+[[test]]
+name = "swap_simulation"
+path = "tests/simulation/swaps.rs"
+
+[[test]]
+name = "live_buy"
+path = "tests/live/buy_sell.rs"
 
 [dependencies]
 anyhow = "1.0.102"
@@ -33,6 +42,7 @@ thiserror = "2"
 tokio = "1.52.3"
 
 [dev-dependencies]
+serde_json = "1"
 # local keypair signing for the live execute_swap test (NOT a runtime dep — Turnkey
 # is the real signer; this is only to exercise the executor end-to-end)
 solana-keypair = "3.0.0"

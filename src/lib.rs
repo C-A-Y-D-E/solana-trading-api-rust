@@ -4,6 +4,8 @@ pub mod error;
 pub mod executor;
 pub mod jupiter;
 pub mod lookup_table;
+mod price_impact;
+pub mod sdk_fee;
 pub mod submit;
 pub mod types;
 
@@ -12,9 +14,15 @@ pub use dexes::pumpfun::PumpFun;
 pub use dexes::pumpswap::{DEFAULT_SOL_USDC_POOL, PumpSwap, USDC_MINT};
 pub use error::{Result, TradeError};
 pub use jupiter::Jupiter;
-pub use lookup_table::{load_address_lookup_table, shared_lookup_addresses};
+pub use lookup_table::{
+    load_address_lookup_table, load_address_lookup_tables, shared_lookup_addresses,
+};
+pub use sdk_fee::SdkFee;
 pub use submit::{BloxrouteSubmitter, RpcSubmitter, SubmitProtection};
-pub use types::{Dex, Quote, Side, Signer, Submitter, SwapResult, SwapStatus, Tip, Trade, Venue};
+pub use types::Settlement;
+pub use types::{
+    Dex, PreparedSwap, Quote, Side, Signer, Submitter, SwapResult, SwapStatus, Tip, Trade, Venue,
+};
 
 pub use solana_client::nonblocking::rpc_client::RpcClient;
 pub use solana_message::AddressLookupTableAccount;

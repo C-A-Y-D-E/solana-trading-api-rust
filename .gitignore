@@ -1,3 +1,12 @@
 /target
-# never commit secrets (the live-buy test reads PRIVATE_KEY from here)
+# never commit secrets
 .env
+.env.*
+!.env.example
+/config/
+*-keypair.json
+*.pem
+*.key
+.DS_Store
+/programs
+/docs

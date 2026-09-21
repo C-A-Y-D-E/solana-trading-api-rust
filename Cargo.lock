@@ -3845,6 +3845,7 @@ dependencies = [
  "borsh",
  "reqwest",
  "serde",
+ "serde_json",
  "sha2",
  "solana-address-lookup-table-interface",
  "solana-client",

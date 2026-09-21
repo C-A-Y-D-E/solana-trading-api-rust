@@ -36,6 +36,9 @@ pub enum TradeError {
     #[error("build transaction: {0}")]
     Build(String),
 
+    #[error("transaction simulation failed: {error}; logs: {logs:?}")]
+    Simulation { error: String, logs: Vec<String> },
+
     #[error("{venue} swap failed: {msg}")]
     Venue { venue: &'static str, msg: String },
 

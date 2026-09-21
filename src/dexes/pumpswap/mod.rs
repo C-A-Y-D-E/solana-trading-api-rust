@@ -5,14 +5,10 @@ use async_trait::async_trait;
 use borsh::BorshDeserialize;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_instruction::{AccountMeta, Instruction};
-use solana_message::AddressLookupTableAccount;
 use solana_pubkey::{Pubkey, pubkey};
 
 use crate::dexes::common::*;
-use crate::types::{Dex, Quote, Side, Trade};
-
-#[cfg(test)]
-mod sell_simulation;
+use crate::types::{Dex, PreparedSwap, Quote, Settlement, Side, Trade};
 
 pub const PROGRAM_ID: Pubkey = pubkey!("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA");
 pub const FEE_PROGRAM_ID: Pubkey = pubkey!("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ");
@@ -27,6 +23,7 @@ const SELL_IX: &str = "sell";
 const MAX_BRIDGE_SLIPPAGE_BPS: u64 = 50;
 
 #[derive(BorshDeserialize)]
+#[cfg_attr(test, derive(borsh::BorshSerialize))]
 #[allow(dead_code)]
 struct PoolAccount {
     discriminator: u64,
@@ -136,6 +133,23 @@ pub struct PumpSwap {
 }
 
 impl PumpSwap {
+    pub(crate) fn sol_usdc_pool(&self) -> Pubkey {
+        self.sol_usdc_pool
+    }
+
+    pub(crate) async fn quote_mint(&self, trade: &Trade) -> Result<Pubkey> {
+        let address = trade
+            .pool
+            .unwrap_or_else(|| Self::canonical_pool_pda(&trade.mint));
+        let account = self.rpc.get_account(&address).await?;
+        let (pool, _) = decode_pool(&account.data)?;
+        anyhow::ensure!(
+            account.owner == PROGRAM_ID && pool.base_mint == trade.mint,
+            "invalid PumpSwap pool"
+        );
+        Ok(pool.quote_mint)
+    }
+
     pub fn new(rpc: Arc<RpcClient>) -> Self {
         Self {
             rpc,
@@ -325,6 +339,12 @@ impl PumpSwap {
 
                 Quote {
                     in_amount: amount,
+                    price_impact_bps: crate::price_impact::exact_input(
+                        pool.quote_reserves,
+                        pool.base_reserves,
+                        quote_into_pool.saturating_sub(1),
+                    ),
+                    application_fee: 0,
                     expected_out,
                     min_out: slippage_down(expected_out, slippage_bps),
                     fee: amount.saturating_sub(quote_into_pool),
@@ -339,6 +359,12 @@ impl PumpSwap {
                 let expected_out = gross_quote_out.saturating_sub(fee);
                 Quote {
                     in_amount: amount,
+                    price_impact_bps: crate::price_impact::exact_input(
+                        pool.base_reserves,
+                        pool.quote_reserves,
+                        amount,
+                    ),
+                    application_fee: 0,
                     expected_out,
                     min_out: slippage_down(expected_out, slippage_bps),
                     fee,
@@ -550,7 +576,7 @@ impl PumpSwap {
         instructions
     }
 
-    fn route_slippage(total_bps: u64) -> (u64, u64) {
+    pub(crate) fn route_slippage(total_bps: u64) -> (u64, u64) {
         let bridge_bps = (total_bps / 2).min(MAX_BRIDGE_SLIPPAGE_BPS);
         (bridge_bps, total_bps - bridge_bps)
     }
@@ -595,8 +621,11 @@ impl PumpSwap {
             );
             return (bridge_quote, target_quote);
         }
-        let bridge_quote =
+        let mut bridge_quote =
             self.compute_quote(bridge_pool, fees, Side::Buy, p.amount, bridge_slippage);
+        // This leg buys exactly min_out; max input is a spending cap, not its execution size.
+        bridge_quote.price_impact_bps =
+            crate::price_impact::exact_output(bridge_pool.base_reserves, bridge_quote.min_out);
         let target_quote = self.compute_quote(
             target_pool,
             fees,
@@ -621,6 +650,11 @@ impl PumpSwap {
         };
         Ok(Quote {
             in_amount: p.amount,
+            price_impact_bps: crate::price_impact::combine(
+                bridge_quote.price_impact_bps,
+                target_quote.price_impact_bps,
+            ),
+            application_fee: 0,
             expected_out: output_quote.expected_out,
             min_out: output_quote.min_out,
             fee: bridge_quote.fee,
@@ -667,21 +701,48 @@ impl PumpSwap {
         target_pool_address: Pubkey,
         target_pool: &PoolState,
         fees: FeeSettings,
-    ) -> Result<(Vec<Instruction>, Vec<AddressLookupTableAccount>)> {
+    ) -> Result<PreparedSwap> {
         let bridge_pool = self.load_sol_usdc_pool().await?;
+        self.prepare_usdc_route(p, target_pool_address, target_pool, &bridge_pool, fees)
+    }
+
+    fn prepare_usdc_route(
+        &self,
+        p: &Trade,
+        target_pool_address: Pubkey,
+        target_pool: &PoolState,
+        bridge_pool: &PoolState,
+        fees: FeeSettings,
+    ) -> Result<PreparedSwap> {
+        let (bridge_quote, target_quote) = self.route_quotes(p, bridge_pool, target_pool, &fees);
+        let output_quote = if p.side == Side::Sell {
+            bridge_quote
+        } else {
+            target_quote
+        };
+        let quote = Quote {
+            in_amount: p.amount,
+            price_impact_bps: crate::price_impact::combine(
+                bridge_quote.price_impact_bps,
+                target_quote.price_impact_bps,
+            ),
+            fee: bridge_quote.fee,
+            ..output_quote
+        };
         if p.side == Side::Sell {
-            return Ok((
-                self.sell_via_usdc_instructions(
+            return Ok(PreparedSwap {
+                venue: self.name(),
+                quote,
+                instructions: self.sell_via_usdc_instructions(
                     p,
                     target_pool_address,
                     target_pool,
-                    &bridge_pool,
+                    bridge_pool,
                     fees,
                 )?,
-                vec![],
-            ));
+                lookup_tables: vec![],
+            });
         }
-        let (bridge_quote, target_quote) = self.route_quotes(p, &bridge_pool, target_pool, &fees);
         if bridge_quote.min_out == 0 || target_quote.min_out == 0 {
             return Err(anyhow!("pumpswap USDC route output is zero"));
         }
@@ -692,7 +753,7 @@ impl PumpSwap {
         let mut instructions = self.buy_instructions(
             &bridge_trade,
             self.sol_usdc_pool,
-            &bridge_pool,
+            bridge_pool,
             fees,
             BuyAmounts::ExactBaseOut {
                 base_out: bridge_quote.min_out,
@@ -713,7 +774,12 @@ impl PumpSwap {
                 min_base_out: target_quote.min_out,
             },
         ));
-        Ok((instructions, vec![]))
+        Ok(PreparedSwap {
+            venue: self.name(),
+            quote,
+            instructions,
+            lookup_tables: vec![],
+        })
     }
 }
 
@@ -729,19 +795,29 @@ impl Dex for PumpSwap {
             self.load_pool(&pool_address, &p.mint).await?,
             self.fee_settings().await?,
         );
-        if Self::swap_route(&pool)? == SwapRoute::ViaUsdc {
+        if p.settlement == Settlement::Usdc {
+            anyhow::ensure!(
+                pool.quote_mint == USDC_MINT,
+                "use TradingClient for USDC settlement through a SOL pool"
+            );
+        } else if Self::swap_route(&pool)? == SwapRoute::ViaUsdc {
             return self.quote_via_usdc(p, &pool, &fees).await;
         }
         Ok(self.compute_quote(&pool, &fees, p.side, p.amount, p.slippage_bps))
     }
 
-    async fn swap(&self, p: &Trade) -> Result<(Vec<Instruction>, Vec<AddressLookupTableAccount>)> {
+    async fn prepare_swap(&self, p: &Trade) -> Result<PreparedSwap> {
         let pool_address = p.pool.unwrap_or_else(|| Self::canonical_pool_pda(&p.mint));
         let (pool, fees) = (
             self.load_pool(&pool_address, &p.mint).await?,
             self.fee_settings().await?,
         );
-        if Self::swap_route(&pool)? == SwapRoute::ViaUsdc {
+        if p.settlement == Settlement::Usdc {
+            anyhow::ensure!(
+                pool.quote_mint == USDC_MINT,
+                "use TradingClient for USDC settlement through a SOL pool"
+            );
+        } else if Self::swap_route(&pool)? == SwapRoute::ViaUsdc {
             return self.swap_via_usdc(p, pool_address, &pool, fees).await;
         }
         let quote = self.compute_quote(&pool, &fees, p.side, p.amount, p.slippage_bps);
@@ -758,527 +834,14 @@ impl Dex for PumpSwap {
             ),
             Side::Sell => self.sell_instructions(p, pool_address, &pool, fees, quote.min_out),
         };
-        Ok((instructions, vec![]))
+        Ok(PreparedSwap {
+            venue: self.name(),
+            quote,
+            instructions,
+            lookup_tables: vec![],
+        })
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::types::Venue;
-
-    #[test]
-    fn decodes_legacy_and_virtual_reserve_pool_layouts() {
-        let mut data = vec![0; 245];
-        assert_eq!(decode_pool(&data).unwrap().1, 0);
-        data.extend_from_slice(&500_000_i128.to_le_bytes());
-        assert_eq!(decode_pool(&data).unwrap().1, 500_000);
-        assert!(decode_pool(&data[..250]).is_err());
-    }
-
-    #[test]
-    fn effective_reserves_include_signed_virtual_liquidity() {
-        assert_eq!(effective_quote_reserves(100, 900).unwrap(), 1_000);
-        assert_eq!(effective_quote_reserves(100, -50).unwrap(), 50);
-        assert!(effective_quote_reserves(100, -101).is_err());
-        assert!(effective_quote_reserves(u64::MAX, 1).is_err());
-        assert!(effective_quote_reserves(1, i128::MAX).is_err());
-    }
-
-    fn test_fees() -> FeeSettings {
-        FeeSettings {
-            standard_protocol_recipient: Pubkey::new_unique(),
-            mayhem_protocol_recipient: Pubkey::new_unique(),
-            buyback_recipient: Pubkey::new_unique(),
-            lp_bps: 20,
-            protocol_bps: 5,
-            creator_bps: 0,
-        }
-    }
-
-    fn test_pool(base_mint: Pubkey, quote_mint: Pubkey) -> PoolState {
-        PoolState {
-            coin_creator: Pubkey::default(),
-            base_mint,
-            quote_mint,
-            base_vault: Pubkey::new_unique(),
-            quote_vault: Pubkey::new_unique(),
-            base_reserves: 1_000_000_000_000,
-            quote_reserves: 10_000_000_000_000,
-            is_mayhem: false,
-            is_cashback: false,
-            base_token_program: TOKEN_PROGRAM,
-            quote_token_program: TOKEN_PROGRAM,
-        }
-    }
-
-    #[test]
-    fn selects_reserved_protocol_recipient_for_mayhem_pool() {
-        let fees = FeeSettings {
-            standard_protocol_recipient: PROGRAM_ID,
-            mayhem_protocol_recipient: FEE_PROGRAM_ID,
-            buyback_recipient: Pubkey::default(),
-            lp_bps: 0,
-            protocol_bps: 0,
-            creator_bps: 0,
-        };
-
-        assert_eq!(fees.protocol_recipient(false), PROGRAM_ID);
-        assert_eq!(fees.protocol_recipient(true), FEE_PROGRAM_ID);
-    }
-
-    #[test]
-    fn route_slippage_reserves_at_most_fifty_bps_for_the_bridge() {
-        assert_eq!(PumpSwap::route_slippage(30), (15, 15));
-        assert_eq!(PumpSwap::route_slippage(500), (50, 450));
-    }
-
-    #[test]
-    fn selects_swap_route_from_the_target_pool_quote_mint() {
-        let mint = Pubkey::new_unique();
-
-        assert_eq!(
-            PumpSwap::swap_route(&test_pool(mint, WSOL)).unwrap(),
-            SwapRoute::DirectSol
-        );
-        assert_eq!(
-            PumpSwap::swap_route(&test_pool(mint, USDC_MINT)).unwrap(),
-            SwapRoute::ViaUsdc
-        );
-        assert!(PumpSwap::swap_route(&test_pool(mint, Pubkey::new_unique())).is_err());
-    }
-
-    #[test]
-    fn bridge_buys_exact_usdc_with_a_capped_sol_spend() {
-        let wallet = Pubkey::new_unique();
-        let trade = Trade::buy(wallet, USDC_MINT, 1_000_000, 300, Some(Venue::PumpSwap));
-        let pool = test_pool(USDC_MINT, WSOL);
-        let dex = PumpSwap::new(Arc::new(RpcClient::new(String::new())));
-        let instructions = dex.buy_instructions(
-            &trade,
-            DEFAULT_SOL_USDC_POOL,
-            &pool,
-            test_fees(),
-            BuyAmounts::ExactBaseOut {
-                base_out: 99_000,
-                max_quote_in: 1_000_000,
-            },
-        );
-
-        assert_eq!(instructions.len(), 6);
-        assert_eq!(instructions[2].program_id, SYSTEM_PROGRAM);
-        assert_eq!(instructions[3].program_id, TOKEN_PROGRAM);
-        assert_eq!(instructions[4].program_id, PROGRAM_ID);
-        assert_eq!(instructions[5].program_id, TOKEN_PROGRAM);
-        assert_eq!(
-            &instructions[4].data[..8],
-            &anchor_discriminator(BUY_EXACT_BASE_OUT_IX)
-        );
-        assert_eq!(
-            u64::from_le_bytes(instructions[4].data[8..16].try_into().unwrap()),
-            99_000
-        );
-        assert_eq!(
-            u64::from_le_bytes(instructions[4].data[16..24].try_into().unwrap()),
-            1_000_000
-        );
-    }
-
-    #[test]
-    fn target_leg_spends_the_exact_bridge_output() {
-        let wallet = Pubkey::new_unique();
-        let target_mint = Pubkey::new_unique();
-        let route = Trade::buy(wallet, target_mint, 10_000_000, 500, Some(Venue::PumpSwap));
-        let bridge_pool = test_pool(USDC_MINT, WSOL);
-        let target_pool = test_pool(target_mint, USDC_MINT);
-        let fees = test_fees();
-        let dex = PumpSwap::new(Arc::new(RpcClient::new(String::new())));
-        let (bridge_quote, target_quote) =
-            dex.route_quotes(&route, &bridge_pool, &target_pool, &fees);
-
-        let instructions = dex.buy_instructions(
-            &route,
-            Pubkey::new_unique(),
-            &target_pool,
-            fees,
-            BuyAmounts::ExactQuoteIn {
-                quote_in: bridge_quote.min_out,
-                min_base_out: target_quote.min_out,
-            },
-        );
-        let swap = instructions.last().unwrap();
-
-        assert_eq!(
-            u64::from_le_bytes(swap.data[8..16].try_into().unwrap()),
-            bridge_quote.min_out
-        );
-    }
-
-    #[test]
-    fn selling_usdc_on_the_bridge_unwraps_sol_to_the_wallet() {
-        let wallet = Pubkey::new_unique();
-        let trade = Trade::sell(wallet, USDC_MINT, 100_000, 500, Some(Venue::PumpSwap));
-        let pool = test_pool(USDC_MINT, WSOL);
-        let dex = PumpSwap::new(Arc::new(RpcClient::new(String::new())));
-        let instructions =
-            dex.sell_instructions(&trade, DEFAULT_SOL_USDC_POOL, &pool, test_fees(), 900_000);
-        assert_eq!(instructions.len(), 3);
-        assert_eq!(&instructions[1].data[..8], &anchor_discriminator(SELL_IX));
-        assert_eq!(
-            u64::from_le_bytes(instructions[1].data[8..16].try_into().unwrap()),
-            100_000
-        );
-        assert_eq!(
-            u64::from_le_bytes(instructions[1].data[16..24].try_into().unwrap()),
-            900_000
-        );
-        assert_eq!(
-            instructions[2],
-            close_account(&ata(&wallet, &WSOL, &TOKEN_PROGRAM), &wallet, &wallet)
-        );
-    }
-
-    #[test]
-    fn sell_route_spends_only_guaranteed_usdc_and_unwraps_sol_last() {
-        let wallet = Pubkey::new_unique();
-        let mint = Pubkey::new_unique();
-        let target_address = Pubkey::new_unique();
-        let trade = Trade::sell(wallet, mint, 1_000_000, 500, Some(Venue::PumpSwap));
-        let target = test_pool(mint, USDC_MINT);
-        let bridge = test_pool(USDC_MINT, WSOL);
-        let fees = test_fees();
-        let dex = PumpSwap::new(Arc::new(RpcClient::new(String::new())));
-        let (bridge_quote, target_quote) = dex.route_quotes(&trade, &bridge, &target, &fees);
-        let instructions = dex
-            .sell_via_usdc_instructions(&trade, target_address, &target, &bridge, fees)
-            .unwrap();
-
-        assert_eq!(instructions.len(), 5);
-        let target_sell = &instructions[1];
-        let bridge_sell = &instructions[3];
-        assert_eq!(&target_sell.data[..8], &anchor_discriminator(SELL_IX));
-        assert_eq!(&bridge_sell.data[..8], &anchor_discriminator(SELL_IX));
-        assert_eq!(target_sell.accounts[0].pubkey, target_address);
-        assert_eq!(bridge_sell.accounts[0].pubkey, DEFAULT_SOL_USDC_POOL);
-        assert_eq!(&target_sell.data[8..16], &trade.amount.to_le_bytes());
-        assert_eq!(&target_sell.data[16..24], &bridge_sell.data[8..16]);
-        assert_eq!(
-            &bridge_sell.data[16..24],
-            &bridge_quote.min_out.to_le_bytes()
-        );
-        assert_eq!(
-            target_sell.accounts[6].pubkey,
-            bridge_sell.accounts[5].pubkey
-        );
-        assert_eq!(bridge_quote.in_amount, target_quote.min_out);
-        assert!(target_quote.expected_out > bridge_quote.in_amount);
-        assert_eq!(
-            instructions[4],
-            close_account(&ata(&wallet, &WSOL, &TOKEN_PROGRAM), &wallet, &wallet)
-        );
-    }
-
-    #[test]
-    fn sell_route_quotes_the_bridge_in_sol_with_split_slippage() {
-        let mint = Pubkey::new_unique();
-        let trade = Trade::sell(Pubkey::new_unique(), mint, 1_000_000, 500, None);
-        let target = test_pool(mint, USDC_MINT);
-        let bridge = test_pool(USDC_MINT, WSOL);
-        let fees = test_fees();
-        let dex = PumpSwap::new(Arc::new(RpcClient::new(String::new())));
-        let (bridge_quote, target_quote) = dex.route_quotes(&trade, &bridge, &target, &fees);
-        let expected_bridge =
-            dex.compute_quote(&bridge, &fees, Side::Sell, target_quote.min_out, 50);
-
-        assert_eq!(
-            target_quote.min_out,
-            slippage_down(target_quote.expected_out, 450)
-        );
-        assert_eq!(bridge_quote.expected_out, expected_bridge.expected_out);
-        assert_eq!(bridge_quote.min_out, expected_bridge.min_out);
-        assert_eq!(bridge_quote.fee, expected_bridge.fee);
-    }
-
-    #[test]
-    fn sell_route_rejects_zero_output_on_either_leg() {
-        let mint = Pubkey::new_unique();
-        let mut target = test_pool(mint, USDC_MINT);
-        let mut bridge = test_pool(USDC_MINT, WSOL);
-        let dex = PumpSwap::new(Arc::new(RpcClient::new(String::new())));
-        let trade = Trade::sell(Pubkey::new_unique(), mint, 1_000_000, 500, None);
-        bridge.quote_reserves = 0;
-        assert!(
-            dex.sell_via_usdc_instructions(
-                &trade,
-                Pubkey::new_unique(),
-                &target,
-                &bridge,
-                test_fees()
-            )
-            .is_err()
-        );
-        bridge.quote_reserves = 10_000_000_000_000;
-        target.quote_reserves = 0;
-        assert!(
-            dex.sell_via_usdc_instructions(
-                &trade,
-                Pubkey::new_unique(),
-                &target,
-                &bridge,
-                test_fees()
-            )
-            .is_err()
-        );
-    }
-
-    #[tokio::test]
-    #[ignore = "live mainnet RPC"]
-    async fn simulate_buy_from_usdc_pool() {
-        let rpc = Arc::new(RpcClient::new(
-            "https://api.mainnet-beta.solana.com".to_string(),
-        ));
-        let dex = PumpSwap::new(rpc);
-        let wallet: Pubkey = "HPkBhdBS8tEfHbsWK1v2f82cPYrXHKZyr29apDbTttuD"
-            .parse()
-            .unwrap();
-        let mint: Pubkey = "aHwwJn74ttpoHxzsrc1UhNHSjxyDAggh1sULqC3pump"
-            .parse()
-            .unwrap();
-        let pool: Pubkey = "EwYm6KmxzpWuwthzAAMd3ND8Bp5TJX9hWnArJisV2TPQ"
-            .parse()
-            .unwrap();
-        let trade = Trade::buy(wallet, mint, 1_000_000, 500, Some(Venue::PumpSwap)).with_pool(pool);
-
-        let quote = dex.quote(&trade).await.unwrap();
-        let (instructions, _) = dex.swap(&trade).await.unwrap();
-        let swaps = instructions
-            .iter()
-            .filter(|instruction| instruction.program_id == PROGRAM_ID)
-            .collect::<Vec<_>>();
-
-        assert!(quote.expected_out > 0);
-        assert!(quote.min_out > 0);
-        assert_eq!(swaps.len(), 2);
-        assert_eq!(
-            &swaps[0].data[..8],
-            &anchor_discriminator(BUY_EXACT_BASE_OUT_IX)
-        );
-        assert_eq!(
-            &swaps[1].data[..8],
-            &anchor_discriminator(BUY_EXACT_QUOTE_IN_IX)
-        );
-        assert_eq!(&swaps[0].data[8..16], &swaps[1].data[8..16]);
-
-        let mut execution_instructions = vec![
-            set_compute_unit_limit(350_000),
-            set_compute_unit_price(50_000),
-        ];
-        execution_instructions.extend(instructions.clone());
-        execution_instructions.push(tip(
-            &wallet,
-            &crate::submit::BloxrouteSubmitter::DEFAULT_TIP_ACCOUNT,
-            crate::submit::BloxrouteSubmitter::MIN_TIP_LAMPORTS,
-        ));
-        let blockhash = dex.rpc.get_latest_blockhash().await.unwrap();
-        let message = solana_message::v0::Message::try_compile(
-            &wallet,
-            &execution_instructions,
-            &[],
-            blockhash,
-        )
-        .unwrap();
-        let transaction = solana_transaction::versioned::VersionedTransaction {
-            signatures: vec![solana_signature::Signature::default()],
-            message: solana_message::VersionedMessage::V0(message),
-        };
-        assert!(bincode::serialized_size(&transaction).unwrap() > 1_232);
-
-        let lookup_addresses =
-            crate::shared_lookup_addresses(dex.rpc.clone(), DEFAULT_SOL_USDC_POOL)
-                .await
-                .unwrap();
-        assert!(!lookup_addresses.contains(&pool));
-        assert!(!lookup_addresses.contains(&mint));
-        assert!(!lookup_addresses.contains(&wallet));
-        let lookup_table = AddressLookupTableAccount {
-            key: Pubkey::new_unique(),
-            addresses: lookup_addresses,
-        };
-        let compressed_message = solana_message::v0::Message::try_compile(
-            &wallet,
-            &execution_instructions,
-            std::slice::from_ref(&lookup_table),
-            blockhash,
-        )
-        .unwrap();
-        let compressed_transaction = solana_transaction::versioned::VersionedTransaction {
-            signatures: vec![solana_signature::Signature::default()],
-            message: solana_message::VersionedMessage::V0(compressed_message),
-        };
-        assert!(bincode::serialized_size(&compressed_transaction).unwrap() <= 1_232);
-        println!(
-            "shared ALT transaction size: {} ({} reusable addresses)",
-            bincode::serialized_size(&compressed_transaction).unwrap(),
-            lookup_table.addresses.len()
-        );
-        let other_wallet = Pubkey::new_unique();
-        let mut other_instructions = execution_instructions.clone();
-        // Replace every wallet-derived address to prove the table is not tied to one user.
-        let mut other_trade = trade;
-        other_trade.wallet = other_wallet;
-        other_instructions.splice(
-            2..2 + instructions.len(),
-            dex.swap(&other_trade).await.unwrap().0,
-        );
-        *other_instructions.last_mut().unwrap() = tip(
-            &other_wallet,
-            &crate::BloxrouteSubmitter::DEFAULT_TIP_ACCOUNT,
-            crate::BloxrouteSubmitter::MIN_TIP_LAMPORTS,
-        );
-        let other_message = solana_message::v0::Message::try_compile(
-            &other_wallet,
-            &other_instructions,
-            &[lookup_table],
-            blockhash,
-        )
-        .unwrap();
-        let other_transaction = solana_transaction::versioned::VersionedTransaction {
-            signatures: vec![solana_signature::Signature::default()],
-            message: solana_message::VersionedMessage::V0(other_message),
-        };
-        assert!(bincode::serialized_size(&other_transaction).unwrap() <= 1_232);
-
-        // Public tables are test fixtures only; their owners can deactivate them.
-        let mut public_lookup_tables = Vec::new();
-        for address in [
-            "9wfFYYUnyXubYcLt1MWNVzS4KXZ2zsojuzAd3bSTU6Jo",
-            "6Nv8PjtF6xymKEBFNhjkSDw1Gbsd9MChE1VmWZsrw6qd",
-        ] {
-            public_lookup_tables.push(
-                crate::load_address_lookup_table(dex.rpc.as_ref(), address.parse().unwrap())
-                    .await
-                    .unwrap(),
-            );
-        }
-        let public_message = solana_message::v0::Message::try_compile(
-            &wallet,
-            &execution_instructions,
-            &public_lookup_tables,
-            blockhash,
-        )
-        .unwrap();
-        let public_transaction = solana_transaction::versioned::VersionedTransaction {
-            signatures: vec![solana_signature::Signature::default()],
-            message: solana_message::VersionedMessage::V0(public_message),
-        };
-        println!(
-            "public ALT transaction size: {}",
-            bincode::serialized_size(&public_transaction).unwrap()
-        );
-        assert!(bincode::serialized_size(&public_transaction).unwrap() <= 1_232);
-        let simulation = dex
-            .rpc
-            .simulate_transaction_with_config(
-                &public_transaction,
-                solana_client::rpc_config::RpcSimulateTransactionConfig {
-                    sig_verify: false,
-                    replace_recent_blockhash: true,
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap()
-            .value;
-        for log in simulation.logs.unwrap_or_default() {
-            println!("{log}");
-        }
-        println!("simulation compute units: {:?}", simulation.units_consumed);
-        assert_eq!(simulation.err, None);
-    }
-
-    #[tokio::test]
-    #[ignore = "live mainnet RPC"]
-    async fn quote_buy_1_sol() {
-        let rpc = Arc::new(RpcClient::new(
-            "https://api.mainnet-beta.solana.com".to_string(),
-        ));
-        let dex = PumpSwap::new(rpc);
-        let mint: Pubkey = "9JihXt4NZtZzURoMm1KrGN6y2a9LH9xdKkh5p9kJpump"
-            .parse()
-            .unwrap();
-
-        let params = Trade::buy(
-            Pubkey::default(),
-            mint,
-            1_000_000_000,
-            300,
-            Some(Venue::PumpSwap),
-        );
-
-        match dex.quote(&params).await {
-            Ok(q) => {
-                println!(
-                    "pumpswap buy 1 SOL → expected {} tokens (min {}), fee {} lamports",
-                    q.expected_out, q.min_out, q.fee
-                );
-                assert!(q.expected_out > 0, "expected nonzero token output");
-            }
-            Err(e) => println!(
-                "pumpswap: no quote (not a canonical WSOL pool, or still on the curve): {e}"
-            ),
-        }
-    }
-
-    #[tokio::test]
-    #[ignore = "live mainnet RPC"]
-    async fn simulate_mayhem_buy() {
-        use solana_client::rpc_config::RpcSimulateTransactionConfig;
-        use solana_message::{VersionedMessage, v0};
-        use solana_signature::Signature;
-        use solana_transaction::versioned::VersionedTransaction;
-
-        let rpc = Arc::new(RpcClient::new(
-            "https://api.mainnet-beta.solana.com".to_string(),
-        ));
-        let dex = PumpSwap::new(rpc.clone());
-        let mint: Pubkey = "HXTaBKp2qa5n2DAzzc949tAJMmuVyRoCQCDNkFKkpump"
-            .parse()
-            .unwrap();
-        let pool: Pubkey = "7aN5B42L5bLTvxoGLCScdqU46o4C1j4zKxmjjrmwQKuR"
-            .parse()
-            .unwrap();
-        let wallet: Pubkey = "7a1xV8pUaJbUMqGVC3Z2NQbhW5pBJT2UXfiSFtuUC18S"
-            .parse()
-            .unwrap();
-
-        assert!(dex.load_pool(&pool, &mint).await.unwrap().is_mayhem);
-
-        let params = Trade::buy(wallet, mint, 100_000, 500, Some(Venue::PumpSwap)).with_pool(pool);
-        let mut instructions = vec![set_compute_unit_limit(350_000), set_compute_unit_price(0)];
-        instructions.extend(dex.swap(&params).await.unwrap().0);
-
-        let blockhash = rpc.get_latest_blockhash().await.unwrap();
-        let msg = v0::Message::try_compile(&wallet, &instructions, &[], blockhash).unwrap();
-        let tx = VersionedTransaction {
-            signatures: vec![Signature::default()],
-            message: VersionedMessage::V0(msg),
-        };
-        let simulation = rpc
-            .simulate_transaction_with_config(
-                &tx,
-                RpcSimulateTransactionConfig {
-                    sig_verify: false,
-                    replace_recent_blockhash: true,
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap()
-            .value;
-
-        for log in simulation.logs.unwrap_or_default() {
-            println!("  {log}");
-        }
-        assert_eq!(simulation.err, None);
-    }
-}
+mod tests;

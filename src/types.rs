@@ -17,8 +17,15 @@ pub enum Venue {
     PumpSwap,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Settlement {
+    Sol,
+    Usdc,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Trade {
+    pub settlement: Settlement,
     pub wallet: Pubkey,
 
     pub mint: Pubkey,
@@ -34,10 +41,7 @@ pub struct Trade {
 }
 
 impl Trade {
-    /// Builds a SOL-funded buy.
-    ///
-    /// PumpSwap automatically bridges through USDC when the target pool is
-    /// quoted in USDC, so `amount` remains SOL lamports for every buy venue.
+    /// Buys with SOL lamports, bridging USDC-quoted PumpSwap pools automatically.
     pub fn buy(
         wallet: Pubkey,
         mint: Pubkey,
@@ -46,6 +50,7 @@ impl Trade {
         venue: Option<Venue>,
     ) -> Self {
         Self {
+            settlement: Settlement::Sol,
             wallet,
             mint,
             side: Side::Buy,
@@ -56,8 +61,7 @@ impl Trade {
         }
     }
 
-    /// Sells base-token units for SOL. PumpSwap USDC pairs bridge the guaranteed
-    /// USDC proceeds to SOL atomically; surplus USDC stays in the wallet.
+    /// Sells base-token units for SOL, bridging USDC-quoted PumpSwap pools automatically.
     pub fn sell(
         wallet: Pubkey,
         mint: Pubkey,
@@ -66,6 +70,7 @@ impl Trade {
         venue: Option<Venue>,
     ) -> Self {
         Self {
+            settlement: Settlement::Sol,
             wallet,
             mint,
             side: Side::Sell,
@@ -80,17 +85,40 @@ impl Trade {
         self.pool = Some(pool);
         self
     }
+
+    /// Selects buy funding or sell proceeds: SOL lamports or USDC base units (6 decimals).
+    pub fn with_settlement(mut self, settlement: Settlement) -> Self {
+        self.settlement = settlement;
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct Quote {
     pub in_amount: u64,
 
+    /// Estimated curve-only execution loss against pre-trade spot; 100 bps = 1%.
+    /// Excludes fees, slippage buffers, rounding and unused intermediate balances.
+    /// None means unavailable (including Jupiter and capped bonding-curve buys), not zero.
+    pub price_impact_bps: Option<f64>,
+
     pub expected_out: u64,
 
     pub min_out: u64,
 
+    /// Venue fee in its quote currency; bridged routes report only the bridge fee in SOL lamports.
     pub fee: u64,
+    /// SDK fee in settlement base units; zero when disabled. Outputs are already net of it.
+    pub application_fee: u64,
+}
+
+/// A quote and its instructions built from the same venue snapshot.
+#[derive(Debug)]
+pub struct PreparedSwap {
+    pub venue: &'static str,
+    pub quote: Quote,
+    pub instructions: Vec<Instruction>,
+    pub lookup_tables: Vec<AddressLookupTableAccount>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -125,7 +153,13 @@ pub trait Dex: Send + Sync {
     async fn swap(
         &self,
         trade: &Trade,
-    ) -> anyhow::Result<(Vec<Instruction>, Vec<AddressLookupTableAccount>)>;
+    ) -> anyhow::Result<(Vec<Instruction>, Vec<AddressLookupTableAccount>)> {
+        let prepared = self.prepare_swap(trade).await?;
+        Ok((prepared.instructions, prepared.lookup_tables))
+    }
+
+    /// Must return the quote enforced by these instructions, without independently requoting.
+    async fn prepare_swap(&self, trade: &Trade) -> anyhow::Result<PreparedSwap>;
 }
 
 #[async_trait]

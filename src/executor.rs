@@ -12,7 +12,10 @@ use solana_transaction::versioned::VersionedTransaction;
 
 use crate::dexes::common::{ata, set_compute_unit_limit, set_compute_unit_price, tip as tip_ix};
 use crate::error::{Result, TradeError};
-use crate::types::{Dex, Side, Signer, Submitter, SwapResult, SwapStatus, Trade};
+use crate::lookup_table::merge_lookup_tables;
+use crate::types::{
+    PreparedSwap, Settlement, Side, Signer, Submitter, SwapResult, SwapStatus, Trade,
+};
 
 const CU_LIMIT_MAX: u32 = 1_400_000;
 
@@ -31,23 +34,18 @@ pub(crate) fn dex_err(venue: &'static str, e: anyhow::Error) -> TradeError {
 
 pub(crate) async fn submit_swap(
     rpc: &Arc<RpcClient>,
-    dex: &dyn Dex,
+    prepared: PreparedSwap,
     signer: &dyn Signer,
     submitter: &dyn Submitter,
     params: &Trade,
     priority_fee_lamports: u64,
     supplemental_lookup_tables: &[AddressLookupTableAccount],
 ) -> Result<SwapResult> {
-    let (instructions, mut alts) = dex.swap(params).await.map_err(|e| dex_err(dex.name(), e))?;
-    for lookup_table in supplemental_lookup_tables {
-        if !alts.iter().any(|existing| existing.key == lookup_table.key) {
-            alts.push(lookup_table.clone());
-        }
-    }
+    let alts = merge_lookup_tables(&prepared.lookup_tables, supplemental_lookup_tables);
     let mut tx = build_optimal_tx(
         rpc,
         &params.wallet,
-        instructions,
+        prepared.instructions,
         &alts,
         priority_fee_lamports,
         submitter,
@@ -63,7 +61,7 @@ pub(crate) async fn submit_swap(
         .map_err(|e| TradeError::Submit(format!("{e:#}")))?;
     Ok(SwapResult {
         hash: sig.to_string(),
-        dex: dex.name(),
+        dex: prepared.venue,
         status: SwapStatus::Pending,
         amount_received: None,
     })
@@ -81,8 +79,9 @@ pub(crate) async fn build_optimal_tx(
         instructions.push(tip_ix(payer, &t.account, t.lamports));
     }
 
-    let cu_limit = match simulate_units(rpc, payer, &instructions, lookup_tables).await {
+    let cu_limit = match simulate_units(rpc, payer, &instructions, lookup_tables).await? {
         Some(units) => ((units as f64 * 1.2) as u32).clamp(1, CU_LIMIT_MAX),
+        // Only a successful simulation missing its CU estimate uses the default.
         None => DEFAULT_CU_LIMIT,
     };
 
@@ -122,11 +121,18 @@ async fn simulate_units(
     payer: &Pubkey,
     instructions: &[Instruction],
     lookup_tables: &[AddressLookupTableAccount],
-) -> Option<u64> {
+) -> Result<Option<u64>> {
     let mut sim_ixs = vec![set_compute_unit_limit(CU_LIMIT_MAX)];
     sim_ixs.extend_from_slice(instructions);
-    let blockhash = rpc.get_latest_blockhash().await.ok()?;
-    let msg = v0::Message::try_compile(payer, &sim_ixs, lookup_tables, blockhash).ok()?;
+    let blockhash = rpc
+        .get_latest_blockhash()
+        .await
+        .map_err(|source| TradeError::Rpc {
+            context: "get_latest_blockhash for simulation",
+            source,
+        })?;
+    let msg = v0::Message::try_compile(payer, &sim_ixs, lookup_tables, blockhash)
+        .map_err(|error| TradeError::Build(format!("compile simulation: {error}")))?;
     let tx = VersionedTransaction {
         signatures: vec![Signature::default()],
         message: VersionedMessage::V0(msg),
@@ -141,12 +147,18 @@ async fn simulate_units(
             },
         )
         .await
-        .ok()?
+        .map_err(|source| TradeError::Rpc {
+            context: "simulate_transaction",
+            source,
+        })?
         .value;
-    if sim.err.is_some() {
-        return None;
+    if let Some(error) = sim.err {
+        return Err(TradeError::Simulation {
+            error: format!("{error:?}"),
+            logs: sim.logs.unwrap_or_default(),
+        });
     }
-    sim.units_consumed
+    Ok(sim.units_consumed)
 }
 
 pub(crate) async fn check_status(rpc: &Arc<RpcClient>, sig: &Signature) -> Result<SwapStatus> {
@@ -196,39 +208,21 @@ pub(crate) async fn output_balance(rpc: &Arc<RpcClient>, p: &Trade) -> u64 {
                 .and_then(|b| b.amount.parse().ok())
                 .unwrap_or(0)
         }
+        Side::Sell if p.settlement == Settlement::Usdc => {
+            let account = ata(
+                &p.wallet,
+                &crate::USDC_MINT,
+                &crate::dexes::common::TOKEN_PROGRAM,
+            );
+            rpc.get_token_account_balance(&account)
+                .await
+                .ok()
+                .and_then(|balance| balance.amount.parse().ok())
+                .unwrap_or(0)
+        }
         Side::Sell => rpc.get_balance(&p.wallet).await.unwrap_or(0),
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn dex_err_preserves_typed_jupiter_error() {
-        let typed = TradeError::Http {
-            venue: "jupiter",
-            status: 401,
-            body: "unauthorized".into(),
-        };
-        let as_anyhow: anyhow::Error = typed.into();
-        match dex_err("jupiter", as_anyhow) {
-            TradeError::Http { venue, status, .. } => {
-                assert_eq!(venue, "jupiter");
-                assert_eq!(status, 401);
-            }
-            other => panic!("expected preserved Http, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn dex_err_wraps_plain_anyhow_as_venue() {
-        match dex_err("pumpfun", anyhow::anyhow!("bonding curve not found")) {
-            TradeError::Venue { venue, msg } => {
-                assert_eq!(venue, "pumpfun");
-                assert!(msg.contains("bonding curve not found"));
-            }
-            other => panic!("expected Venue, got {other:?}"),
-        }
-    }
-}
+mod tests;

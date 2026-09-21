@@ -12,13 +12,21 @@ use crate::dexes::pumpswap::PumpSwap;
 use crate::error::{Result, TradeError};
 use crate::executor::{check_status, confirm, dex_err, output_balance, submit_swap};
 use crate::jupiter::Jupiter;
-use crate::types::{Dex, Quote, Signer, Submitter, SwapResult, SwapStatus, Trade, Venue};
+use crate::lookup_table::{load_address_lookup_tables, merge_lookup_tables};
+use crate::sdk_fee::SdkFee;
+use crate::types::{
+    Dex, PreparedSwap, Quote, Settlement, Signer, Submitter, SwapResult, SwapStatus, Trade, Venue,
+};
+
+mod usdc;
 
 pub struct TradingClient {
     rpc: Arc<RpcClient>,
     pumpfun: PumpFun,
     pumpswap: PumpSwap,
     jupiter: Jupiter,
+    sdk_fee: Option<SdkFee>,
+    shared_lookup_tables: Vec<AddressLookupTableAccount>,
 
     pub deadline: Duration,
 }
@@ -33,6 +41,8 @@ impl TradingClient {
             pumpfun: PumpFun::new(rpc.clone()),
             pumpswap: PumpSwap::new(rpc.clone()),
             jupiter: Jupiter::new(jupiter_base_url, jupiter_api_key),
+            sdk_fee: None,
+            shared_lookup_tables: Vec::new(),
             deadline: Duration::from_secs(30),
             rpc,
         }
@@ -44,23 +54,97 @@ impl TradingClient {
         self
     }
 
-    pub async fn quote(&self, t: &Trade) -> Result<Quote> {
-        let primary = match t.venue {
-            Some(Venue::PumpFun) => venue_err("pumpfun", self.pumpfun.quote(t).await),
-            Some(Venue::PumpSwap) => venue_err("pumpswap", self.pumpswap.quote(t).await),
-            None => venue_err("jupiter", self.jupiter.quote(t).await),
-        };
-        match primary {
-            Ok(q) => Ok(q),
-            Err(e) if allows_jupiter_fallback(t.venue) => {
-                eprintln!(
-                    "trading-client: {:?} quote failed ({e}); falling back to Jupiter",
-                    t.venue
-                );
-                venue_err("jupiter", self.jupiter.quote(t).await)
-            }
-            Err(e) => Err(e),
+    /// Adds a settlement-currency fee, including explicit Jupiter routes (venue None).
+    /// Automatic Jupiter fallback remains disabled when a fee is configured.
+    pub fn with_sdk_fee(mut self, fee: SdkFee) -> Self {
+        self.sdk_fee = Some(fee);
+        self
+    }
+
+    fn dex(&self, venue: Option<Venue>) -> &dyn Dex {
+        match venue {
+            Some(Venue::PumpFun) => &self.pumpfun,
+            Some(Venue::PumpSwap) => &self.pumpswap,
+            None => &self.jupiter,
         }
+    }
+
+    fn fallback(&self, venue: Option<Venue>) -> Option<&dyn Dex> {
+        (self.sdk_fee.is_none() && allows_jupiter_fallback(venue))
+            .then_some(&self.jupiter as &dyn Dex)
+    }
+
+    /// Replaces shared ALT snapshots. Caller-loaded tables must be active on this client's cluster.
+    pub fn with_shared_lookup_tables(mut self, tables: Vec<AddressLookupTableAccount>) -> Self {
+        self.shared_lookup_tables = merge_lookup_tables(&tables, &[]);
+        self
+    }
+
+    /// Loads shared ALTs once from this client's RPC; no ALT RPC requests are added to each swap.
+    pub async fn with_shared_lookup_table_addresses(
+        mut self,
+        addresses: &[Pubkey],
+    ) -> Result<Self> {
+        self.shared_lookup_tables = load_address_lookup_tables(&self.rpc, addresses).await?;
+        Ok(self)
+    }
+
+    pub fn shared_lookup_tables(&self) -> &[AddressLookupTableAccount] {
+        &self.shared_lookup_tables
+    }
+
+    /// Reload after extending a table. Failed refreshes leave all existing snapshots unchanged.
+    pub async fn refresh_shared_lookup_tables(&mut self) -> Result<()> {
+        let addresses: Vec<_> = self
+            .shared_lookup_tables
+            .iter()
+            .map(|table| table.key)
+            .collect();
+        let refreshed = load_address_lookup_tables(&self.rpc, &addresses).await?;
+        self.shared_lookup_tables = refreshed;
+        Ok(())
+    }
+
+    pub async fn quote(&self, t: &Trade) -> Result<Quote> {
+        if t.settlement == Settlement::Usdc {
+            return Ok(self.prepare_swap(t).await?.quote);
+        }
+        validate_settlement(t)?;
+        let adjusted = self.sdk_fee.map_or(Ok(*t), |fee| fee.venue_trade(t))?;
+        let dex = self.dex(t.venue);
+        let quote = match (dex.quote(&adjusted).await, self.fallback(t.venue)) {
+            (Ok(quote), _) => quote,
+            (Err(_), Some(fallback)) => {
+                venue_err(fallback.name(), fallback.quote(&adjusted).await)?
+            }
+            (Err(error), None) => return Err(dex_err(dex.name(), error)),
+        };
+        self.sdk_fee
+            .map_or(Ok(quote), |fee| fee.net_quote(t, quote))
+    }
+
+    /// Builds the full route and optional fee without signing or sending a transaction.
+    pub async fn prepare_swap(&self, trade: &Trade) -> Result<PreparedSwap> {
+        if trade.settlement == Settlement::Usdc && trade.venue.is_some() {
+            validate_settlement(trade)?;
+            let adjusted = self
+                .sdk_fee
+                .map_or(Ok(*trade), |fee| fee.venue_trade(trade))?;
+            let prepared = usdc::prepare(&adjusted, &self.pumpfun, &self.pumpswap)
+                .await
+                .map_err(|error| dex_err("usdc-route", error))?;
+            return match self.sdk_fee {
+                Some(fee) => fee.apply(trade, prepared),
+                None => Ok(prepared),
+            };
+        }
+        prepare_trade(
+            trade,
+            self.dex(trade.venue),
+            self.fallback(trade.venue),
+            self.sdk_fee,
+        )
+        .await
     }
 
     pub async fn swap(
@@ -127,41 +211,19 @@ impl TradingClient {
         priority_fee_lamports: u64,
         lookup_tables: &[AddressLookupTableAccount],
     ) -> Result<SwapResult> {
-        let dex: &dyn Dex = match t.venue {
-            Some(Venue::PumpFun) => &self.pumpfun,
-            Some(Venue::PumpSwap) => &self.pumpswap,
-            None => &self.jupiter,
-        };
-        match submit_swap(
+        let combined_tables = merge_lookup_tables(lookup_tables, &self.shared_lookup_tables);
+        let prepared = self.prepare_swap(t).await?;
+        // No fallback after preparation: a submission error may mean the transaction landed.
+        submit_swap(
             &self.rpc,
-            dex,
+            prepared,
             signer,
             submitter,
             t,
             priority_fee_lamports,
-            lookup_tables,
+            &combined_tables,
         )
         .await
-        {
-            Ok(r) => Ok(r),
-            Err(e) if allows_jupiter_fallback(t.venue) => {
-                eprintln!(
-                    "trading-client: {:?} pre-send failed ({e}); falling back to Jupiter",
-                    t.venue
-                );
-                submit_swap(
-                    &self.rpc,
-                    &self.jupiter,
-                    signer,
-                    submitter,
-                    t,
-                    priority_fee_lamports,
-                    lookup_tables,
-                )
-                .await
-            }
-            Err(e) => Err(e),
-        }
     }
 
     pub async fn status(&self, hash: &str) -> Result<SwapStatus> {
@@ -195,8 +257,41 @@ impl TradingClient {
     }
 }
 
+pub(crate) async fn prepare_trade(
+    trade: &Trade,
+    primary: &dyn Dex,
+    fallback: Option<&dyn Dex>,
+    fee: Option<SdkFee>,
+) -> Result<PreparedSwap> {
+    validate_settlement(trade)?;
+    let adjusted = fee.map_or(Ok(*trade), |fee| fee.venue_trade(trade))?;
+    let prepared = match (primary.prepare_swap(&adjusted).await, fallback) {
+        (Ok(prepared), _) => prepared,
+        (Err(_), Some(fallback)) if fee.is_none() && trade.settlement == Settlement::Sol => {
+            fallback
+                .prepare_swap(&adjusted)
+                .await
+                .map_err(|error| dex_err(fallback.name(), error))?
+        }
+        (Err(error), _) => return Err(dex_err(primary.name(), error)),
+    };
+    match fee {
+        Some(fee) => fee.apply(trade, prepared),
+        None => Ok(prepared),
+    }
+}
+
 fn allows_jupiter_fallback(venue: Option<Venue>) -> bool {
     matches!(venue, Some(Venue::PumpFun))
+}
+
+fn validate_settlement(trade: &Trade) -> Result<()> {
+    if trade.settlement == Settlement::Usdc
+        && (trade.amount == 0 || trade.slippage_bps >= 10_000 || trade.mint == crate::USDC_MINT)
+    {
+        return Err(TradeError::Build("USDC trade requires a different target mint, positive input, and slippage below 10000 bps".into()));
+    }
+    Ok(())
 }
 
 fn venue_err(venue: &'static str, r: anyhow::Result<Quote>) -> Result<Quote> {
@@ -204,49 +299,4 @@ fn venue_err(venue: &'static str, r: anyhow::Result<Quote>) -> Result<Quote> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use solana_pubkey::pubkey;
-
-    fn jupiter_api_key() -> Option<String> {
-        let env = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/.env")).ok()?;
-        env.lines().find_map(|l| {
-            l.trim()
-                .strip_prefix("JUPITER_API_KEY=")
-                .map(|v| v.trim().trim_matches('"').to_string())
-        })
-    }
-
-    #[test]
-    fn pumpswap_never_falls_back_to_jupiter() {
-        assert!(!allows_jupiter_fallback(Some(Venue::PumpSwap)));
-        assert!(allows_jupiter_fallback(Some(Venue::PumpFun)));
-    }
-
-    #[tokio::test]
-    #[ignore = "live: needs JUPITER_API_KEY in .env"]
-    async fn jupiter_quote() {
-        let Some(key) = jupiter_api_key() else {
-            println!("skip: no JUPITER_API_KEY in .env");
-            return;
-        };
-        let rpc = Arc::new(RpcClient::new(
-            "https://api.mainnet-beta.solana.com".to_string(),
-        ));
-        let client = TradingClient::new(rpc, "https://api.jup.ag", Some(key));
-
-        let trade = Trade::buy(
-            pubkey!("11111111111111111111111111111111"),
-            pubkey!("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"),
-            1_000_000,
-            100,
-            None,
-        );
-        let q = client.quote(&trade).await.expect("jupiter quote failed");
-        println!(
-            "jupiter buy 0.001 SOL → USDC: expect {} (min {})",
-            q.expected_out, q.min_out
-        );
-        assert!(q.expected_out > 0);
-    }
-}
+mod tests;
