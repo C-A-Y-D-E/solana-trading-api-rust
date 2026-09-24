@@ -115,4 +115,5 @@ pub(crate) fn merge_lookup_tables(
 }
 
 #[cfg(test)]
+#[path = "../tests/unit/lookup_table.rs"]
 mod tests;

@@ -151,4 +151,5 @@ pub fn slippage_down(x: u64, bps: u64) -> u64 {
 }
 
 #[cfg(test)]
+#[path = "../../tests/unit/dexes/common.rs"]
 mod tests;

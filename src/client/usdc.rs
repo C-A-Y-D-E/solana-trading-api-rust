@@ -7,6 +7,7 @@ use crate::{
 };
 
 #[cfg(test)]
+#[path = "../../tests/unit/client/usdc.rs"]
 mod tests;
 
 pub(super) async fn prepare(
@@ -24,7 +25,9 @@ pub(super) async fn prepare(
             }
             pumpswap
         }
-        None => anyhow::bail!("USDC settlement requires PumpFun or PumpSwap"),
+        None => {
+            anyhow::bail!("native USDC routing requires PumpFun or PumpSwap")
+        }
     };
     prepare_via_sol(trade, target, pumpswap, pumpswap.sol_usdc_pool()).await
 }

@@ -92,7 +92,7 @@ async fn buy_then_sell_all() {
     let balance = rpc.get_balance(&wallet).await.unwrap();
     println!("wallet:  {wallet}");
     println!(
-        "fee wallet: {} ({} bps; no Jupiter fallback)",
+        "fee wallet: {} ({} bps; retained on Jupiter fallback)",
         fee.recipient(),
         fee.basis_points()
     );
@@ -131,7 +131,7 @@ async fn buy_then_sell_all() {
         Trade::sell(wallet, mint, amount, 1_000, Some(Venue::PumpSwap)).with_pool(TARGET_POOL);
     let sell_quote = client.quote(&sell).await.expect("sell quote failed");
     println!(
-        "sell quote: application fee {} lamports (1% of guaranteed minimum proceeds)",
+        "sell quote: application fee {} lamports (1% of quoted expected proceeds)",
         sell_quote.application_fee
     );
     let sell_res = client

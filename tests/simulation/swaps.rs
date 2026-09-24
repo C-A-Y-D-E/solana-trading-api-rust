@@ -1,5 +1,7 @@
 use std::{env, sync::Arc};
 
+mod sponsored;
+
 use anyhow::{Context, Result, bail, ensure};
 use solana_client::rpc_config::{
     RpcSimulateTransactionAccountsConfig, RpcSimulateTransactionConfig,
@@ -83,7 +85,7 @@ async fn simulate_swap(side: Side, settlement: Settlement) -> Result<()> {
     );
     let fee_basis = match side {
         Side::Buy => trade.amount,
-        Side::Sell => prepared.quote.min_out + expected_fee,
+        Side::Sell => prepared.quote.expected_out + expected_fee,
     };
     ensure!(expected_fee == fee_basis / 100, "incorrect 1% fee");
 

@@ -235,46 +235,8 @@ async fn recent_creation_slot(rpc: &RpcClient) -> Result<u64> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    #[ignore = "read-only mainnet simulation; no keypair or broadcast"]
-    async fn simulate_shared_alt_creation() {
-        let rpc = RpcClient::new(DEFAULT_RPC_URL.into());
-        let payer: Pubkey = "HPkBhdBS8tEfHbsWK1v2f82cPYrXHKZyr29apDbTttuD"
-            .parse()
-            .unwrap();
-        let slot = recent_creation_slot(&rpc).await.unwrap();
-        let (create, table) = create_lookup_table(payer, payer, slot);
-        let addresses = (0..EXTEND_CHUNK_SIZE)
-            .map(|_| Pubkey::new_unique())
-            .collect();
-        let extend = extend_lookup_table(table, payer, Some(payer), addresses);
-        let transaction = Transaction::new_with_payer(&[create, extend], Some(&payer));
-        assert!(bincode::serialized_size(&transaction).unwrap() <= 1_232);
-        let result = rpc
-            .simulate_transaction_with_config(
-                &transaction,
-                solana_client::rpc_config::RpcSimulateTransactionConfig {
-                    sig_verify: false,
-                    replace_recent_blockhash: true,
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap()
-            .value;
-        println!(
-            "Creation slot: {slot}; simulation: {:?}; CU: {:?}",
-            result.err, result.units_consumed
-        );
-        for log in result.logs.unwrap_or_default() {
-            println!("{log}");
-        }
-        assert_eq!(result.err, None);
-    }
-}
+#[path = "../tests/unit/examples/create_shared_alt.rs"]
+mod tests;
 
 fn load_keypair() -> Result<Keypair> {
     let key = setting(PRIVATE_KEY_ENV)?

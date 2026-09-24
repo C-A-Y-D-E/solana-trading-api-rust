@@ -13,6 +13,7 @@ use crate::error::{Result, TradeError};
 use crate::types::{Dex, PreparedSwap, Quote, Settlement, Side, Trade};
 
 #[cfg(test)]
+#[path = "../tests/unit/jupiter.rs"]
 mod tests;
 
 pub struct Jupiter {
@@ -41,6 +42,7 @@ impl BuildResponse {
     fn validate(&self, trade: &Trade) -> Result<()> {
         let (input, output) = Jupiter::route_mints(trade);
         if self.swap_mode != "ExactIn"
+            || trade.slippage_bps >= 10_000
             || self.input_mint != input.to_string()
             || self.output_mint != output.to_string()
             || parse_amount("inAmount", &self.in_amount)? != trade.amount
@@ -51,10 +53,15 @@ impl BuildResponse {
             ));
         }
         let quote = self.quote()?;
-        if quote.min_out == 0 || quote.expected_out < quote.min_out {
+        let slippage_floor =
+            u128::from(quote.expected_out) * u128::from(10_000 - trade.slippage_bps) / 10_000;
+        if quote.min_out == 0
+            || quote.expected_out < quote.min_out
+            || u128::from(quote.min_out) < slippage_floor
+        {
             return Err(TradeError::Decode(
                 "jupiter",
-                "invalid minimum output".into(),
+                "invalid minimum output or slippage".into(),
             ));
         }
         Ok(())
@@ -69,6 +76,7 @@ impl BuildResponse {
             min_out: parse_amount("otherAmountThreshold", &self.other_amount_threshold)?,
             fee: 0,
             application_fee: 0,
+            sponsorship_fee: 0,
         })
     }
 }
@@ -128,7 +136,7 @@ impl Jupiter {
         }
     }
 
-    async fn build(&self, p: &Trade) -> Result<BuildResponse> {
+    async fn build(&self, p: &Trade, payer: Option<&Pubkey>) -> Result<BuildResponse> {
         let (input_mint, output_mint) = Self::route_mints(p);
         if p.amount == 0 || p.slippage_bps >= 10_000 || input_mint == output_mint {
             return Err(TradeError::Build(
@@ -147,6 +155,9 @@ impl Jupiter {
                 ("slippageBps", p.slippage_bps.to_string()),
                 ("wrapAndUnwrapSol", "true".into()),
             ]);
+        if let Some(payer) = payer {
+            req = req.query(&[("payer", payer.to_string())]);
+        }
         if let Some(key) = &self.api_key {
             req = req.header("x-api-key", key);
         }
@@ -165,6 +176,35 @@ impl Jupiter {
             .map_err(|e| TradeError::Decode("jupiter", e.to_string()))?;
         build.validate(p)?;
         Ok(build)
+    }
+
+    async fn prepare_with_payer(
+        &self,
+        trade: &Trade,
+        payer: Option<&Pubkey>,
+    ) -> Result<PreparedSwap> {
+        let build = self.build(trade, payer).await?;
+        let instructions = Self::swap_instructions(&build)?;
+        if instructions
+            .iter()
+            .flat_map(|ix| &ix.accounts)
+            .any(|account| {
+                account.is_signer
+                    && account.pubkey != trade.wallet
+                    && Some(&account.pubkey) != payer
+            })
+        {
+            return Err(TradeError::Decode(
+                "jupiter",
+                "route requires an additional signer".into(),
+            ));
+        }
+        Ok(PreparedSwap {
+            venue: self.name(),
+            quote: build.quote()?,
+            instructions,
+            lookup_tables: Self::lookup_tables(&build)?,
+        })
     }
 
     fn swap_instructions(b: &BuildResponse) -> Result<Vec<Instruction>> {
@@ -213,19 +253,19 @@ impl Dex for Jupiter {
     }
 
     async fn quote(&self, p: &Trade) -> anyhow::Result<Quote> {
-        Ok(self.build(p).await?.quote()?)
+        Ok(self.build(p, None).await?.quote()?)
     }
 
     async fn prepare_swap(&self, p: &Trade) -> anyhow::Result<PreparedSwap> {
-        let build = self.build(p).await?;
-        let instructions = Self::swap_instructions(&build)?;
-        let alts = Self::lookup_tables(&build)?;
-        Ok(PreparedSwap {
-            venue: self.name(),
-            quote: build.quote()?,
-            instructions,
-            lookup_tables: alts,
-        })
+        Ok(self.prepare_with_payer(p, None).await?)
+    }
+
+    async fn prepare_sponsored_swap(
+        &self,
+        trade: &Trade,
+        payer: &Pubkey,
+    ) -> anyhow::Result<PreparedSwap> {
+        Ok(self.prepare_with_payer(trade, Some(payer)).await?)
     }
 }
 

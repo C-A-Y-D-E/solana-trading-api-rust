@@ -35,6 +35,7 @@ pub struct Trade {
 
     pub slippage_bps: u64,
 
+    /// None compares Jupiter and configured DFlow; Some selects a native venue with fallback.
     pub venue: Option<Venue>,
 
     pub pool: Option<Pubkey>,
@@ -81,6 +82,7 @@ impl Trade {
         }
     }
 
+    /// Selects the native pool; USDC comparison or native failure may choose an aggregator instead.
     pub fn with_pool(mut self, pool: Pubkey) -> Self {
         self.pool = Some(pool);
         self
@@ -99,7 +101,7 @@ pub struct Quote {
 
     /// Estimated curve-only execution loss against pre-trade spot; 100 bps = 1%.
     /// Excludes fees, slippage buffers, rounding and unused intermediate balances.
-    /// None means unavailable (including Jupiter and capped bonding-curve buys), not zero.
+    /// None means unavailable (including aggregators and capped bonding-curve buys), not zero.
     pub price_impact_bps: Option<f64>,
 
     pub expected_out: u64,
@@ -107,9 +109,13 @@ pub struct Quote {
     pub min_out: u64,
 
     /// Venue fee in its quote currency; bridged routes report only the bridge fee in SOL lamports.
+    /// Aggregators return zero here when fees are not separately itemized, not when trading is free.
     pub fee: u64,
-    /// SDK fee in settlement base units; zero when disabled. Outputs are already net of it.
+    /// SDK fee in settlement base units: buy gross input or sell quoted expected output times the rate.
+    /// Zero when disabled; outputs are already net of it. Not a percentage of actual sell proceeds.
     pub application_fee: u64,
+    /// Reserved USDC sponsorship ceiling, already reflected in amounts; finalized before signing.
+    pub sponsorship_fee: u64,
 }
 
 /// A quote and its instructions built from the same venue snapshot.
@@ -143,6 +149,9 @@ pub struct SwapResult {
     pub status: SwapStatus,
 
     pub amount_received: Option<u64>,
+
+    /// USDC charge encoded in the submitted transaction; collected only on successful execution.
+    pub sponsorship_fee: u64,
 }
 
 #[async_trait]
@@ -160,6 +169,15 @@ pub trait Dex: Send + Sync {
 
     /// Must return the quote enforced by these instructions, without independently requoting.
     async fn prepare_swap(&self, trade: &Trade) -> anyhow::Result<PreparedSwap>;
+
+    /// Requires explicit support for sponsored rent as well as network fees.
+    async fn prepare_sponsored_swap(
+        &self,
+        _trade: &Trade,
+        _payer: &Pubkey,
+    ) -> anyhow::Result<PreparedSwap> {
+        anyhow::bail!("{} does not support sponsored swaps", self.name())
+    }
 }
 
 #[async_trait]

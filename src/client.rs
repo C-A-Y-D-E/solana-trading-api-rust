@@ -10,14 +10,16 @@ use crate::dexes::common::ata;
 use crate::dexes::pumpfun::PumpFun;
 use crate::dexes::pumpswap::PumpSwap;
 use crate::error::{Result, TradeError};
-use crate::executor::{check_status, confirm, dex_err, output_balance, submit_swap};
+use crate::executor::{SwapSigners, check_status, confirm, dex_err, output_balance, submit_swap};
 use crate::jupiter::Jupiter;
 use crate::lookup_table::{load_address_lookup_tables, merge_lookup_tables};
 use crate::sdk_fee::SdkFee;
 use crate::types::{
     Dex, PreparedSwap, Quote, Settlement, Signer, Submitter, SwapResult, SwapStatus, Trade, Venue,
 };
+use crate::{DFlow, GasSponsor};
 
+mod routing;
 mod usdc;
 
 pub struct TradingClient {
@@ -25,7 +27,9 @@ pub struct TradingClient {
     pumpfun: PumpFun,
     pumpswap: PumpSwap,
     jupiter: Jupiter,
+    dflow: Option<DFlow>,
     sdk_fee: Option<SdkFee>,
+    gas_sponsor: Option<GasSponsor>,
     shared_lookup_tables: Vec<AddressLookupTableAccount>,
 
     pub deadline: Duration,
@@ -41,7 +45,9 @@ impl TradingClient {
             pumpfun: PumpFun::new(rpc.clone()),
             pumpswap: PumpSwap::new(rpc.clone()),
             jupiter: Jupiter::new(jupiter_base_url, jupiter_api_key),
+            dflow: None,
             sdk_fee: None,
+            gas_sponsor: None,
             shared_lookup_tables: Vec::new(),
             deadline: Duration::from_secs(30),
             rpc,
@@ -54,24 +60,46 @@ impl TradingClient {
         self
     }
 
-    /// Adds a settlement-currency fee, including explicit Jupiter routes (venue None).
-    /// Automatic Jupiter fallback remains disabled when a fee is configured.
+    /// Adds one settlement-currency fee, including aggregator routes.
     pub fn with_sdk_fee(mut self, fee: SdkFee) -> Self {
         self.sdk_fee = Some(fee);
         self
     }
 
-    fn dex(&self, venue: Option<Venue>) -> &dyn Dex {
+    /// Sponsors every USDC-settled trade on this client, including native routes. SOL trades are unchanged.
+    /// Always recovers sponsor expenses plus the configured service fee (1 USDC by default).
+    /// This is opt-in policy, not automatic low-balance detection; use a separate unsponsored client otherwise.
+    pub fn with_gas_sponsor(mut self, sponsor: GasSponsor) -> Self {
+        self.gas_sponsor = Some(sponsor);
+        self
+    }
+
+    fn sponsor_for(&self, trade: &Trade) -> Option<&GasSponsor> {
+        self.gas_sponsor
+            .as_ref()
+            .filter(|_| trade.settlement == Settlement::Usdc)
+    }
+
+    fn route_trade(&self, trade: &Trade) -> Result<Trade> {
+        let adjusted = trade_after_fee(trade, self.sdk_fee)?;
+        match self.sponsor_for(trade) {
+            Some(sponsor) => sponsor.reserve_fee(&adjusted),
+            None => Ok(adjusted),
+        }
+    }
+
+    /// Adds DFlow to aggregator comparisons and native fallbacks. Production requires an API key.
+    pub fn with_dflow(mut self, base_url: impl Into<String>, api_key: Option<String>) -> Self {
+        self.dflow = Some(DFlow::new(self.rpc.clone(), base_url, api_key));
+        self
+    }
+
+    fn venue_adapter(&self, venue: Option<Venue>) -> &dyn Dex {
         match venue {
             Some(Venue::PumpFun) => &self.pumpfun,
             Some(Venue::PumpSwap) => &self.pumpswap,
             None => &self.jupiter,
         }
-    }
-
-    fn fallback(&self, venue: Option<Venue>) -> Option<&dyn Dex> {
-        (self.sdk_fee.is_none() && allows_jupiter_fallback(venue))
-            .then_some(&self.jupiter as &dyn Dex)
     }
 
     /// Replaces shared ALT snapshots. Caller-loaded tables must be active on this client's cluster.
@@ -105,72 +133,83 @@ impl TradingClient {
         Ok(())
     }
 
-    pub async fn quote(&self, t: &Trade) -> Result<Quote> {
-        if t.settlement == Settlement::Usdc {
-            return Ok(self.prepare_swap(t).await?.quote);
-        }
-        validate_settlement(t)?;
-        let adjusted = self.sdk_fee.map_or(Ok(*t), |fee| fee.venue_trade(t))?;
-        let dex = self.dex(t.venue);
-        let quote = match (dex.quote(&adjusted).await, self.fallback(t.venue)) {
-            (Ok(quote), _) => quote,
-            (Err(_), Some(fallback)) => {
-                venue_err(fallback.name(), fallback.quote(&adjusted).await)?
-            }
-            (Err(error), None) => return Err(dex_err(dex.name(), error)),
+    /// Compares aggregators when no venue is selected, and all available routes for USDC trades.
+    /// Selected native SOL venues try aggregators only on preparation failure.
+    pub async fn quote(&self, trade: &Trade) -> Result<Quote> {
+        let fee_adjusted_trade = self.route_trade(trade)?;
+        match self.should_compare_routes(trade).await {
+            Ok(true) => return Ok(self.prepare_best_swap(trade).await?.quote),
+            Err(error) => return Ok(self.prepare_aggregator_fallback(trade, error).await?.quote),
+            Ok(false) => {}
         };
-        self.sdk_fee
-            .map_or(Ok(quote), |fee| fee.net_quote(t, quote))
+        let primary_venue = self.venue_adapter(trade.venue);
+        let venue_quote = match routing::bounded_route(primary_venue.name(), async {
+            primary_venue
+                .quote(&fee_adjusted_trade)
+                .await
+                .map_err(|error| dex_err(primary_venue.name(), error))
+        })
+        .await
+        {
+            Ok(quote) => quote,
+            Err(error) if trade.venue.is_some() => {
+                return Ok(self.prepare_aggregator_fallback(trade, error).await?.quote);
+            }
+            Err(error) => return Err(error),
+        };
+        match self.sdk_fee {
+            Some(fee) => fee.quote_after_fee(trade, venue_quote),
+            None => Ok(venue_quote),
+        }
     }
 
     /// Builds the full route and optional fee without signing or sending a transaction.
+    /// Native SOL preparation can fall back; simulation, signing and submission never retry a route.
     pub async fn prepare_swap(&self, trade: &Trade) -> Result<PreparedSwap> {
-        if trade.settlement == Settlement::Usdc && trade.venue.is_some() {
-            validate_settlement(trade)?;
-            let adjusted = self
-                .sdk_fee
-                .map_or(Ok(*trade), |fee| fee.venue_trade(trade))?;
-            let prepared = usdc::prepare(&adjusted, &self.pumpfun, &self.pumpswap)
-                .await
-                .map_err(|error| dex_err("usdc-route", error))?;
-            return match self.sdk_fee {
-                Some(fee) => fee.apply(trade, prepared),
-                None => Ok(prepared),
-            };
+        self.route_trade(trade)?;
+        match self.should_compare_routes(trade).await {
+            Ok(true) => return self.prepare_best_swap(trade).await,
+            Err(error) => return self.prepare_aggregator_fallback(trade, error).await,
+            Ok(false) => {}
         }
-        prepare_trade(
-            trade,
-            self.dex(trade.venue),
-            self.fallback(trade.venue),
-            self.sdk_fee,
-        )
-        .await
+        match prepare_venue_swap(trade, self.venue_adapter(trade.venue), self.sdk_fee).await {
+            Err(error) if trade.venue.is_some() => {
+                self.prepare_aggregator_fallback(trade, error).await
+            }
+            result => result,
+        }
     }
 
     pub async fn swap(
         &self,
-        t: &Trade,
+        trade: &Trade,
         signer: &dyn Signer,
         submitter: &dyn Submitter,
         priority_fee_lamports: u64,
     ) -> Result<SwapResult> {
-        self.swap_with_lookup_tables(t, signer, submitter, priority_fee_lamports, &[])
+        self.swap_with_lookup_tables(trade, signer, submitter, priority_fee_lamports, &[])
             .await
     }
 
     /// Executes a swap with additional on-chain address lookup tables.
     pub async fn swap_with_lookup_tables(
         &self,
-        t: &Trade,
+        trade: &Trade,
         signer: &dyn Signer,
         submitter: &dyn Submitter,
         priority_fee_lamports: u64,
         lookup_tables: &[AddressLookupTableAccount],
     ) -> Result<SwapResult> {
-        let before = output_balance(&self.rpc, t).await;
+        let before = output_balance(&self.rpc, trade).await;
 
         let pending = self
-            .submit_with_lookup_tables(t, signer, submitter, priority_fee_lamports, lookup_tables)
+            .submit_with_lookup_tables(
+                trade,
+                signer,
+                submitter,
+                priority_fee_lamports,
+                lookup_tables,
+            )
             .await?;
         let sig = pending
             .hash
@@ -179,7 +218,11 @@ impl TradingClient {
 
         let status = confirm(&self.rpc, &sig, self.deadline).await?;
         let amount_received = if status == SwapStatus::Confirmed {
-            Some(output_balance(&self.rpc, t).await.saturating_sub(before))
+            Some(
+                output_balance(&self.rpc, trade)
+                    .await
+                    .saturating_sub(before),
+            )
         } else {
             None
         };
@@ -188,38 +231,42 @@ impl TradingClient {
             dex: pending.dex,
             status,
             amount_received,
+            sponsorship_fee: pending.sponsorship_fee,
         })
     }
 
     pub async fn submit(
         &self,
-        t: &Trade,
+        trade: &Trade,
         signer: &dyn Signer,
         submitter: &dyn Submitter,
         priority_fee_lamports: u64,
     ) -> Result<SwapResult> {
-        self.submit_with_lookup_tables(t, signer, submitter, priority_fee_lamports, &[])
+        self.submit_with_lookup_tables(trade, signer, submitter, priority_fee_lamports, &[])
             .await
     }
 
     /// Submits a swap with additional on-chain address lookup tables.
     pub async fn submit_with_lookup_tables(
         &self,
-        t: &Trade,
+        trade: &Trade,
         signer: &dyn Signer,
         submitter: &dyn Submitter,
         priority_fee_lamports: u64,
         lookup_tables: &[AddressLookupTableAccount],
     ) -> Result<SwapResult> {
         let combined_tables = merge_lookup_tables(lookup_tables, &self.shared_lookup_tables);
-        let prepared = self.prepare_swap(t).await?;
+        let prepared = self.prepare_swap(trade).await?;
         // No fallback after preparation: a submission error may mean the transaction landed.
         submit_swap(
             &self.rpc,
             prepared,
-            signer,
+            SwapSigners {
+                user: signer,
+                sponsor: self.sponsor_for(trade),
+            },
             submitter,
-            t,
+            trade,
             priority_fee_lamports,
             &combined_tables,
         )
@@ -257,32 +304,23 @@ impl TradingClient {
     }
 }
 
-pub(crate) async fn prepare_trade(
+pub(crate) async fn prepare_venue_swap(
     trade: &Trade,
-    primary: &dyn Dex,
-    fallback: Option<&dyn Dex>,
-    fee: Option<SdkFee>,
+    primary_venue: &dyn Dex,
+    sdk_fee: Option<SdkFee>,
 ) -> Result<PreparedSwap> {
-    validate_settlement(trade)?;
-    let adjusted = fee.map_or(Ok(*trade), |fee| fee.venue_trade(trade))?;
-    let prepared = match (primary.prepare_swap(&adjusted).await, fallback) {
-        (Ok(prepared), _) => prepared,
-        (Err(_), Some(fallback)) if fee.is_none() && trade.settlement == Settlement::Sol => {
-            fallback
-                .prepare_swap(&adjusted)
-                .await
-                .map_err(|error| dex_err(fallback.name(), error))?
-        }
-        (Err(error), _) => return Err(dex_err(primary.name(), error)),
-    };
-    match fee {
-        Some(fee) => fee.apply(trade, prepared),
+    let fee_adjusted_trade = trade_after_fee(trade, sdk_fee)?;
+    let prepared = routing::bounded_route(primary_venue.name(), async {
+        primary_venue
+            .prepare_swap(&fee_adjusted_trade)
+            .await
+            .map_err(|error| dex_err(primary_venue.name(), error))
+    })
+    .await?;
+    match sdk_fee {
+        Some(fee) => fee.apply_to_swap(trade, prepared),
         None => Ok(prepared),
     }
-}
-
-fn allows_jupiter_fallback(venue: Option<Venue>) -> bool {
-    matches!(venue, Some(Venue::PumpFun))
 }
 
 fn validate_settlement(trade: &Trade) -> Result<()> {
@@ -294,9 +332,19 @@ fn validate_settlement(trade: &Trade) -> Result<()> {
     Ok(())
 }
 
-fn venue_err(venue: &'static str, r: anyhow::Result<Quote>) -> Result<Quote> {
-    r.map_err(|e| dex_err(venue, e))
+fn trade_after_fee(trade: &Trade, sdk_fee: Option<SdkFee>) -> Result<Trade> {
+    validate_settlement(trade)?;
+    if trade.amount == 0 || trade.slippage_bps >= 10_000 {
+        return Err(TradeError::Build(
+            "amount must be positive and slippage below 10000 bps".into(),
+        ));
+    }
+    match sdk_fee {
+        Some(fee) => fee.trade_after_fee(trade),
+        None => Ok(*trade),
+    }
 }
 
 #[cfg(test)]
+#[path = "../tests/unit/client/mod.rs"]
 mod tests;

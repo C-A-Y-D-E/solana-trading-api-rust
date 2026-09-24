@@ -13,8 +13,8 @@ use crate::types::{Dex, PreparedSwap, Quote, Settlement, Side, Trade};
 pub const PROGRAM_ID: Pubkey = pubkey!("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
 pub const FEE_PROGRAM_ID: Pubkey = pubkey!("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ");
 
-const BUY_IX: &str = "buy_exact_sol_in";
-const SELL_IX: &str = "sell";
+pub(crate) const BUY_IX: &str = "buy_exact_sol_in";
+pub(crate) const SELL_IX: &str = "sell";
 
 #[derive(BorshDeserialize)]
 #[allow(dead_code)]
@@ -226,6 +226,7 @@ impl PumpFun {
                         )
                     },
                     application_fee: 0,
+                    sponsorship_fee: 0,
                     expected_out,
                     min_out: slippage_down(expected_out, slippage_bps),
                     fee: amount.saturating_sub(sol_into_curve),
@@ -249,6 +250,7 @@ impl PumpFun {
                         amount,
                     ),
                     application_fee: 0,
+                    sponsorship_fee: 0,
                     expected_out,
                     min_out: slippage_down(expected_out, slippage_bps),
                     fee,
@@ -394,4 +396,5 @@ impl Dex for PumpFun {
 }
 
 #[cfg(test)]
+#[path = "../../../tests/unit/dexes/pumpfun/mod.rs"]
 mod tests;

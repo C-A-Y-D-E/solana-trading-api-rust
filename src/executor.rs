@@ -10,6 +10,7 @@ use solana_pubkey::Pubkey;
 use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
 
+use crate::GasSponsor;
 use crate::dexes::common::{ata, set_compute_unit_limit, set_compute_unit_price, tip as tip_ix};
 use crate::error::{Result, TradeError};
 use crate::lookup_table::merge_lookup_tables;
@@ -21,6 +22,49 @@ const CU_LIMIT_MAX: u32 = 1_400_000;
 
 const DEFAULT_CU_LIMIT: u32 = 350_000;
 const MAX_TRANSACTION_BYTES: u64 = 1_232;
+
+pub(crate) struct SwapSigners<'a> {
+    pub user: &'a dyn Signer,
+    pub sponsor: Option<&'a GasSponsor>,
+}
+
+impl SwapSigners<'_> {
+    fn payer(&self, wallet: &Pubkey) -> Pubkey {
+        self.sponsor.map_or(*wallet, GasSponsor::wallet)
+    }
+
+    fn user_signer_index(&self, wallet: &Pubkey, tx: &VersionedTransaction) -> Result<usize> {
+        let required = usize::from(tx.message.header().num_required_signatures);
+        let signers = &tx.message.static_account_keys()[..required];
+        let payer = self.payer(wallet);
+        if signers.first() != Some(&payer)
+            || !signers.contains(wallet)
+            || signers.iter().any(|key| *key != *wallet && *key != payer)
+        {
+            return Err(TradeError::Sign(
+                "transaction requires unexpected signers".into(),
+            ));
+        }
+        Ok(signers.iter().position(|key| key == wallet).unwrap())
+    }
+
+    async fn sign(&self, wallet: &Pubkey, tx: &mut VersionedTransaction) -> Result<()> {
+        let user_index = self.user_signer_index(wallet, tx)?;
+        tx.signatures[user_index] = self
+            .user
+            .sign(wallet, tx)
+            .await
+            .map_err(|error| TradeError::Sign(format!("user: {error:#}")))?;
+        if let Some(sponsor) = self.sponsor {
+            tx.signatures[0] = sponsor
+                .signer
+                .sign(&sponsor.wallet(), tx)
+                .await
+                .map_err(|error| TradeError::Sign(format!("sponsor: {error:#}")))?;
+        }
+        Ok(())
+    }
+}
 
 pub(crate) fn dex_err(venue: &'static str, e: anyhow::Error) -> TradeError {
     match e.downcast::<TradeError>() {
@@ -35,26 +79,41 @@ pub(crate) fn dex_err(venue: &'static str, e: anyhow::Error) -> TradeError {
 pub(crate) async fn submit_swap(
     rpc: &Arc<RpcClient>,
     prepared: PreparedSwap,
-    signer: &dyn Signer,
+    signers: SwapSigners<'_>,
     submitter: &dyn Submitter,
     params: &Trade,
     priority_fee_lamports: u64,
     supplemental_lookup_tables: &[AddressLookupTableAccount],
 ) -> Result<SwapResult> {
     let alts = merge_lookup_tables(&prepared.lookup_tables, supplemental_lookup_tables);
+    let reimbursement_index = prepared
+        .instructions
+        .len()
+        .checked_sub(1)
+        .map(|index| index + 2);
+    let mut sponsorship_fee = prepared.quote.sponsorship_fee;
     let mut tx = build_optimal_tx(
         rpc,
-        &params.wallet,
+        &signers.payer(&params.wallet),
         prepared.instructions,
         &alts,
         priority_fee_lamports,
         submitter,
     )
     .await?;
-    tx.signatures[0] = signer
-        .sign(&params.wallet, &tx)
-        .await
-        .map_err(|e| TradeError::Sign(format!("{e:#}")))?;
+    signers.user_signer_index(&params.wallet, &tx)?;
+    if let Some(sponsor) = signers.sponsor {
+        sponsorship_fee = sponsor
+            .cost_policy
+            .finalize_fee(
+                rpc,
+                &mut tx,
+                reimbursement_index
+                    .ok_or_else(|| TradeError::Build("missing sponsorship transfer".into()))?,
+            )
+            .await?;
+    }
+    signers.sign(&params.wallet, &mut tx).await?;
     let sig = submitter
         .submit(&tx)
         .await
@@ -64,6 +123,7 @@ pub(crate) async fn submit_swap(
         dex: prepared.venue,
         status: SwapStatus::Pending,
         amount_received: None,
+        sponsorship_fee,
     })
 }
 
@@ -103,7 +163,7 @@ pub(crate) async fn build_optimal_tx(
     let msg = v0::Message::try_compile(payer, &all, lookup_tables, blockhash)
         .map_err(|e| TradeError::Build(format!("compile message: {e:?}")))?;
     let tx = VersionedTransaction {
-        signatures: vec![Signature::default()],
+        signatures: vec![Signature::default(); usize::from(msg.header.num_required_signatures)],
         message: VersionedMessage::V0(msg),
     };
     let serialized_size = bincode::serialized_size(&tx)
@@ -134,7 +194,7 @@ async fn simulate_units(
     let msg = v0::Message::try_compile(payer, &sim_ixs, lookup_tables, blockhash)
         .map_err(|error| TradeError::Build(format!("compile simulation: {error}")))?;
     let tx = VersionedTransaction {
-        signatures: vec![Signature::default()],
+        signatures: vec![Signature::default(); usize::from(msg.header.num_required_signatures)],
         message: VersionedMessage::V0(msg),
     };
     let sim = rpc
@@ -225,4 +285,5 @@ pub(crate) async fn output_balance(rpc: &Arc<RpcClient>, p: &Trade) -> u64 {
 }
 
 #[cfg(test)]
+#[path = "../tests/unit/executor.rs"]
 mod tests;

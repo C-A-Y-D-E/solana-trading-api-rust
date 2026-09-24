@@ -22,4 +22,5 @@ pub(crate) fn combine(first: Option<f64>, second: Option<f64>) -> Option<f64> {
 }
 
 #[cfg(test)]
+#[path = "../tests/unit/price_impact.rs"]
 mod tests;

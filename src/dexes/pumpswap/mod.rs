@@ -17,9 +17,9 @@ pub const DEFAULT_SOL_USDC_POOL: Pubkey = pubkey!("Gf7sXMoP8iRw4iiXmJ1nq4vxcRycb
 
 const PUMPFUN_PROGRAM_ID: Pubkey = pubkey!("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
 
-const BUY_EXACT_BASE_OUT_IX: &str = "buy";
-const BUY_EXACT_QUOTE_IN_IX: &str = "buy_exact_quote_in";
-const SELL_IX: &str = "sell";
+pub(crate) const BUY_EXACT_BASE_OUT_IX: &str = "buy";
+pub(crate) const BUY_EXACT_QUOTE_IN_IX: &str = "buy_exact_quote_in";
+pub(crate) const SELL_IX: &str = "sell";
 const MAX_BRIDGE_SLIPPAGE_BPS: u64 = 50;
 
 #[derive(BorshDeserialize)]
@@ -345,6 +345,7 @@ impl PumpSwap {
                         quote_into_pool.saturating_sub(1),
                     ),
                     application_fee: 0,
+                    sponsorship_fee: 0,
                     expected_out,
                     min_out: slippage_down(expected_out, slippage_bps),
                     fee: amount.saturating_sub(quote_into_pool),
@@ -365,6 +366,7 @@ impl PumpSwap {
                         amount,
                     ),
                     application_fee: 0,
+                    sponsorship_fee: 0,
                     expected_out,
                     min_out: slippage_down(expected_out, slippage_bps),
                     fee,
@@ -655,6 +657,7 @@ impl PumpSwap {
                 target_quote.price_impact_bps,
             ),
             application_fee: 0,
+            sponsorship_fee: 0,
             expected_out: output_quote.expected_out,
             min_out: output_quote.min_out,
             fee: bridge_quote.fee,
@@ -844,4 +847,5 @@ impl Dex for PumpSwap {
 }
 
 #[cfg(test)]
+#[path = "../../../tests/unit/dexes/pumpswap/mod.rs"]
 mod tests;
