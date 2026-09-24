@@ -123,6 +123,7 @@ pub(crate) async fn submit_swap(
         dex: prepared.venue,
         status: SwapStatus::Pending,
         amount_received: None,
+        application_fee: prepared.quote.application_fee,
         sponsorship_fee,
     })
 }

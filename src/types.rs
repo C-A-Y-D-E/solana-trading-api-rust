@@ -150,6 +150,10 @@ pub struct SwapResult {
 
     pub amount_received: Option<u64>,
 
+    /// SDK charge encoded in the transaction, in settlement units (SOL lamports or USDC base units).
+    /// Collected only on successful execution; zero when disabled. Excludes venue/network fees.
+    pub application_fee: u64,
+
     /// USDC charge encoded in the submitted transaction; collected only on successful execution.
     pub sponsorship_fee: u64,
 }

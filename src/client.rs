@@ -231,6 +231,7 @@ impl TradingClient {
             dex: pending.dex,
             status,
             amount_received,
+            application_fee: pending.application_fee,
             sponsorship_fee: pending.sponsorship_fee,
         })
     }

@@ -64,6 +64,20 @@ when preparing the swap and is subtracted from both expected and minimum output.
 Quotes are rejected if the fees would leave no positive minimum output. A successful
 simulation is not a guarantee that a future transaction will land.
 
+Both `submit` and `swap` return fee amounts from the transaction being submitted,
+not from an earlier preview quote:
+
+```rust,ignore
+let result = client.swap(&trade, signer, submitter, 5_000).await?;
+let sdk_fee = result.application_fee;     // SOL lamports or USDC base units, per trade.settlement.
+let sponsor_fee = result.sponsorship_fee; // USDC base units; finalized reimbursement + service fee.
+```
+
+These are the encoded charges, collected only if execution succeeds. Pending
+does not mean paid; failed execution rolls them back. Both are zero when their
+feature is disabled. They do not itemize venue fees or user-paid network fees,
+tips and account rent; sponsor reimbursement can include sponsor-paid costs.
+
 Direct SOL-pair trades try Pump.fun/PumpSwap first. If native quoting, pool lookup,
 or instruction preparation fails or times out, Jupiter and configured DFlow compete
 as fallbacks. A successful native route makes no aggregator requests.
@@ -86,6 +100,10 @@ submission, or confirmation failure stops the trade without another route attemp
 `prepare_swap(...).venue` identifies the winner. A later `swap` prepares fresh
 routes and may choose differently. Aggregator price impact is unavailable (`None`)
 because provider figures are not the SDK's curve-only metric.
+
+`quote` and `swap` apply `slippage_bps` to their own route snapshot. The swap
+does not preserve the earlier preview's absolute minimum; it enforces the
+minimum from its freshly prepared route. There is no caller-supplied minimum.
 
 Add DFlow once on the client:
 
